@@ -80,13 +80,13 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.JIB_TOKEN }}
 
       - name: Build and push Docker image via Jib
         env:
           JIB_GHCR_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           JIB_GHCR_USERNAME: ${{ github.actor }}
-          JIB_GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          JIB_GHCR_PASSWORD: ${{ secrets.JIB_TOKEN }}
           JIB_GHCR_TAGS: "latest,${{ needs.build.outputs.version }},${{ github.sha }}"
         run: ./gradlew :loader:jibGhcr --no-daemon
 
