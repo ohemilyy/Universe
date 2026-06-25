@@ -35,6 +35,9 @@ tasks.jib {
 }
 
 jib {
+    from {
+        image = "amazoncorretto:25-jdk"
+    }
     to {
         image = "git.lunarlabs.dev/scala/universe:dev"
         setTags(provider {
