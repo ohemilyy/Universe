@@ -37,7 +37,7 @@ The Tailscale CLI is a thin client — it needs to talk to the `tailscaled` daem
 ```yaml
 services:
   universe:
-    image: git.lunarlabs.dev/scala/universe:latest
+    image: ghcr.io/universeclouddev/universe:latest
     volumes:
       - ./data:/data
       - /usr/bin/tailscale:/usr/bin/tailscale:ro       # binary
