@@ -32,7 +32,7 @@ jobs:
           cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/production' }}
 
       - name: Build all modules
-        run: ./gradlew assemble --no-daemon
+        run: ./gradlew build --no-daemon
 
       - name: Collect JAR artifacts
         run: mkdir -p .built && find . -path "*/build/libs/*.jar" -not -path "*/buildSrc/*" -exec cp {} .built/ \;
