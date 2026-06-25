@@ -2,7 +2,7 @@ package gg.scala.universe.docker
 
 data class DockerImageConfig(
     val repository: String = "azul-zulu",
-    val tag: String = "25-jdk-alpine",
+    val tag: String = "21-jdk-alpine",
     val registry: String? = null,
     val platform: String? = null
 )

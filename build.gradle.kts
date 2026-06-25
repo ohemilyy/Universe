@@ -51,9 +51,9 @@ subprojects {
     }
 
     kotlin {
-        jvmToolchain(25)
+        jvmToolchain(21)
         compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_25)
+            jvmTarget.set(JvmTarget.JVM_21)
         }
     }
 

@@ -36,7 +36,7 @@ tasks.jib {
 
 jib {
     from {
-        image = "amazoncorretto:25-jdk"
+        image = "amazoncorretto:21"
     }
     to {
         image = "git.lunarlabs.dev/scala/universe:dev"
