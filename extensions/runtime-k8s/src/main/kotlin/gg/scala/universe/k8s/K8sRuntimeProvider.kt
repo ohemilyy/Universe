@@ -25,6 +25,7 @@ import io.fabric8.kubernetes.api.model.VolumeMountBuilder
 import io.fabric8.kubernetes.client.ConfigBuilder
 import io.fabric8.kubernetes.client.KubernetesClient
 import io.fabric8.kubernetes.client.KubernetesClientBuilder
+import io.fabric8.kubernetes.client.KubernetesClientException
 import com.google.gson.Gson
 import gg.scala.universe.schema.Template
 import gg.scala.universe.schema.TemplateInstallationConfig
@@ -380,6 +381,17 @@ class K8sRuntimeProvider(
                 .log
                 .lines()
                 .filter { it.isNotBlank() }
+        } catch (e: KubernetesClientException) {
+            // A missing pod (404) is expected once an instance has stopped or restarted — its
+            // logs are simply gone. Log at DEBUG so a live-log stream tailing a just-deleted pod
+            // cannot flood the console with the same "not found" warning on every poll. Genuine
+            // failures (auth, connectivity, etc.) still surface as warnings.
+            if (e.code == 404) {
+                log("No K8s logs for instance $instanceId: pod '$podName' is gone", LogLevel.DEBUG)
+            } else {
+                log("Failed to get K8s logs for instance $instanceId: ${e.message}", LogLevel.WARNING)
+            }
+            emptyList()
         } catch (e: Exception) {
             log("Failed to get K8s logs for instance $instanceId: ${e.message}", LogLevel.WARNING)
             emptyList()

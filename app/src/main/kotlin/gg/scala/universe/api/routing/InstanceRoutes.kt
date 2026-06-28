@@ -129,10 +129,20 @@ fun Application.configureInstanceRoutes(
                         return@webSocket
                     }
 
-                    // Poll for new log lines every 500ms
+                    // Poll for new log lines every 500ms. Stop once the instance is no longer
+                    // active (stopped, offline, or removed) so we don't tail a deleted pod
+                    // forever — which otherwise spins this loop and re-fetches gone logs every tick.
                     var lastLineCount = 0
                     try {
                         while (true) {
+                            val current = clusterStateService.getInstance(id)
+                            if (current == null ||
+                                current.state == InstanceState.STOPPED ||
+                                current.state == InstanceState.OFFLINE
+                            ) {
+                                outgoing.send(Frame.Text("--- instance is no longer running; closing log stream ---"))
+                                break
+                            }
                             val logLines = runtimeProvider.getLogs(id, 1000)
                             if (logLines.size > lastLineCount) {
                                 val newLines = logLines.drop(lastLineCount)

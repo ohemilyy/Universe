@@ -53,6 +53,9 @@ class PortAllocator @Inject constructor(
             instances, now, InstanceLifecyclePolicy.CREATING_TIMEOUT_MS
         )
 
+        // Pass 1 — hand out a port that is free by every measure. The local set is honoured
+        // here, so a port that was just allocated for an in-flight deploy (allocated, but not
+        // yet written onto its CREATING record) is never handed to a concurrent caller.
         for (port in range.min..range.max) {
             // 1. Check local in-memory allocations
             if (allocatedPorts.contains(port)) {
@@ -74,6 +77,26 @@ class PortAllocator @Inject constructor(
             }
 
             allocatedPorts.add(port)
+            log("Allocated port $port (range ${range.min}-${range.max})")
+            return port
+        }
+
+        // Pass 2 — the range looks exhausted. Before giving up, reclaim any port that is held
+        // only by the in-JVM set but owned by no live instance: a stale reservation left by a
+        // deploy that died without releasing it (or that released the port-0 sentinel). Without
+        // this, a single leaked fixed port wedges its whole range for the lifetime of the JVM,
+        // so a static instance can never start again until Universe itself is restarted — which
+        // is exactly the "No available ports … reserved locally in this JVM" failure on restart.
+        for (port in range.min..range.max) {
+            if (port in reserved) continue                 // genuinely held by a live instance
+            if (!allocatedPorts.contains(port)) continue   // not a local reservation; pass 1 already judged it
+            if (!isPortAvailable(port)) continue           // really bound on this host — don't steal it
+            log(
+                "Reclaiming stale local reservation for port $port — no live instance owns it " +
+                "(left by a deploy that never released it)",
+                LogLevel.WARNING
+            )
+            // The port is already in allocatedPorts, so it stays marked as ours — just hand it out.
             log("Allocated port $port (range ${range.min}-${range.max})")
             return port
         }
