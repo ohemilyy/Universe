@@ -37,15 +37,16 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
 
       - name: Build all modules
-        # copyToRootTarget stages each module's shadowJar into .built/ (assemble's
-        # finalizer doesn't fire reliably in CI); request it explicitly.
-        run: ./gradlew assemble copyToRootTarget --no-daemon
+        # :loader:shadowJar is the runnable fat jar (loader + embedded app); assemble
+        # keeps compiling every module. Published from its real output path — the
+        # .built/ staging task doesn't materialize in CI.
+        run: ./gradlew assemble :loader:shadowJar --no-daemon
 
-      - name: Upload built JARs
+      - name: Upload runnable jar
         uses: actions/upload-artifact@v4
         with:
           name: universe-jars
-          path: .built/
+          path: loader/build/libs/universe.jar
           retention-days: 1
 
   release:
@@ -62,12 +63,7 @@ jobs:
           path: .built/
 
       - name: Create Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: |
-            .built/universe-loader-*.jar
-            .built/universe-extension-*.jar
-            .built/universe-minecraft-*.jar
-            .built/universe-api-*.jar
-            .built/universe-app-*.jar
+          files: .built/universe.jar

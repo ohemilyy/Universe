@@ -32,20 +32,18 @@ jobs:
           cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/production' }}
 
       - name: Build all modules
-        # copyToRootTarget stages each module's shadowJar into .built/. It's only
-        # wired as a finalizer of assemble, which doesn't fire reliably in CI —
-        # request it explicitly so .built/ is actually populated for upload/release.
-        run: ./gradlew assemble copyToRootTarget --no-daemon
+        # assemble compiles every module (the PR compile check); :loader:shadowJar
+        # produces the runnable fat jar (loader + embedded app) — the exact artifact
+        # the container image runs. The .built/ staging task doesn't materialize in
+        # CI, so we publish the loader jar straight from its real output path.
+        run: ./gradlew assemble :loader:shadowJar --no-daemon
 
-      - name: List built jars
-        run: ls -la .built/ || echo "no jars in .built/"
-
-      - name: Upload built JARs
+      - name: Upload runnable jar
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: universe-jars-${{ github.sha }}
-          path: .built/
+          path: loader/build/libs/universe.jar
           retention-days: 7
 
   push-docker:
