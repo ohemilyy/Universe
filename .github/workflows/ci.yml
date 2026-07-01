@@ -99,3 +99,34 @@ jobs:
           JIB_PASSWORD: ${{ secrets.JIB_TOKEN }}
           JIB_TAGS: ${{ steps.vars.outputs.moving_tag }}
         run: ./gradlew :loader:jib --no-daemon
+
+  publish-jars:
+    name: Publish downloadable jars
+    needs: build
+    # Refresh a rolling 'latest' GitHub Release with the jars 'build' already
+    # produced, on production only. Gives people a stable download link instead
+    # of expiring, login-walled Actions artifacts — no manual tag, no local build.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/production'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built jars
+        uses: actions/download-artifact@v4
+        with:
+          name: universe-jars-${{ github.sha }}
+          path: .built/
+
+      - name: Refresh 'latest' release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        # Delete + recreate so the 'latest' tag tracks production HEAD and stale
+        # assets (e.g. after a version bump) don't linger. gh is preinstalled on the runner.
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest .built/*.jar \
+            --target "$GITHUB_SHA" \
+            --title "Latest build (${GITHUB_SHA::7})" \
+            --notes "Automated build from production @ ${GITHUB_SHA::7}." \
+            --prerelease
