@@ -37,7 +37,9 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
 
       - name: Build all modules
-        run: ./gradlew assemble --no-daemon
+        # copyToRootTarget stages each module's shadowJar into .built/ (assemble's
+        # finalizer doesn't fire reliably in CI); request it explicitly.
+        run: ./gradlew assemble copyToRootTarget --no-daemon
 
       - name: Upload built JARs
         uses: actions/upload-artifact@v4
