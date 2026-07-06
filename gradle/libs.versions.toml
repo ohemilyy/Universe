@@ -37,7 +37,7 @@ spigot-legacy = "1.19-R0.1"
 velocity = "3.5.0-SNAPSHOT"
 folia = "1.21.8-R0.1-SNAPSHOT"
 bungeecord = "1.21-R0.5-SNAPSHOT"
-jda = "6.4.2"
+jda = "6.5.0"
 cloudDiscord = "1.0.0-beta.4"
 
 [libraries]
