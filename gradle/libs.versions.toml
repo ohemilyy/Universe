@@ -4,7 +4,7 @@
 
 [versions]
 kotlin = "2.4.0"
-shadow = "9.5.0"
+shadow = "9.5.1"
 jib = "3.5.3"
 gradle-git-properties = "2.5.7"
 guice = "7.0.0"
