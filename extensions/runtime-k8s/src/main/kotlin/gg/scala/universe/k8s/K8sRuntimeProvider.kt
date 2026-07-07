@@ -3,6 +3,7 @@ package gg.scala.universe.k8s
 import gg.scala.universe.console.LogLevel
 import gg.scala.universe.console.log
 import gg.scala.universe.runtime.AdoptedResource
+import gg.scala.universe.runtime.JvmHeapArgs
 import gg.scala.universe.runtime.NodeAllocatable
 import gg.scala.universe.runtime.ReconcileAction
 import gg.scala.universe.runtime.ResourceSnapshot
@@ -124,11 +125,21 @@ class K8sRuntimeProvider(
         if (nodeId.isNotBlank()) labels[LABEL_NODE] = nodeId
         labels.putAll(config.labels)
 
+        val perConfigOptOut = configuration.properties["autoHeap"].equals("false", ignoreCase = true)
+        val effectiveCommand = if (config.autoHeap && !perConfigOptOut) {
+            JvmHeapArgs.inject(command, ramMB, config.heapFraction, config.minHeapMB)
+        } else {
+            command
+        }
+        if (effectiveCommand != command) {
+            log("K8s pod '$podName' auto-heap: injected ${JvmHeapArgs.safeHeapMB(ramMB, config.heapFraction, config.minHeapMB)}M heap (of ${ramMB}M container) into the java command")
+        }
+
         val containerBuilder = ContainerBuilder()
             .withName("main")
             .withImage(resolveImage(config.image, environmentVariables))
             .withImagePullPolicy(config.imagePullPolicy)
-            .withCommand("sh", "-c", command)
+            .withCommand("sh", "-c", effectiveCommand)
             .withWorkingDir(config.workingDir)
             .withStdin(true)
             .withTty(true)
@@ -320,26 +331,41 @@ class K8sRuntimeProvider(
         if (!ready) {
             // Capture diagnostics, then delete the pod+service we just created so a failed
             // start never leaks a hostPort-holding zombie that blocks future deploys.
-            val status = k8s.pods().inNamespace(namespace).withName(podName).get()?.status
+            val failedPod = k8s.pods().inNamespace(namespace).withName(podName).get()
+            val status = failedPod?.status
             val phase = status?.phase ?: "unknown"
             val containerStatus = status?.containerStatuses?.firstOrNull()
             val reason = containerStatus?.state?.waiting?.reason ?: containerStatus?.state?.terminated?.reason ?: "unknown"
             val message = containerStatus?.state?.waiting?.message ?: containerStatus?.state?.terminated?.message ?: ""
 
-            log(
-                "K8s pod '$podName' (instance $instanceId) did not become ready in ${config.timeoutSeconds}s " +
-                "(phase=$phase, reason=$reason). Deleting pod+service to release its port.",
-                LogLevel.ERROR
-            )
+            val schedulingFailure = unschedulableReason(failedPod)
+            if (schedulingFailure != null) {
+                log(
+                    "K8s pod '$podName' (instance $instanceId) cannot schedule: $schedulingFailure. " +
+                    "This config does not fit the cluster as sized (ram=${ramMB}M, cpu=$cpu). " +
+                    "Deleting pod+service; the enforcer will back off before retrying.",
+                    LogLevel.ERROR
+                )
+            } else {
+                log(
+                    "K8s pod '$podName' (instance $instanceId) did not become ready in ${config.timeoutSeconds}s " +
+                    "(phase=$phase, reason=$reason). Deleting pod+service to release its port.",
+                    LogLevel.ERROR
+                )
+            }
             // Wait for the pod to actually be gone before returning, so the freed hostPort is
             // really available when the caller releases the port and a retry reuses it.
             deletePodServiceAndWait(k8s, namespace, instanceId, podName)
             podNames.remove(instanceId)
 
             throw RuntimeException(
-                "K8s pod '$podName' failed to become ready within ${config.timeoutSeconds}s. " +
-                "Phase: $phase, Reason: $reason${if (message.isNotBlank()) ", Message: $message" else ""}. " +
-                "Command: $command"
+                if (schedulingFailure != null) {
+                    "K8s pod '$podName' is unschedulable: $schedulingFailure. Command: $effectiveCommand"
+                } else {
+                    "K8s pod '$podName' failed to become ready within ${config.timeoutSeconds}s. " +
+                    "Phase: $phase, Reason: $reason${if (message.isNotBlank()) ", Message: $message" else ""}. " +
+                    "Command: $effectiveCommand"
+                }
             )
         }
 
@@ -469,7 +495,7 @@ class K8sRuntimeProvider(
         var orphans = 0
         var deadDeleted = 0
         val now = System.currentTimeMillis()
-        val graceMs = config.pendingGraceSeconds * 1000L
+        val graceMs = maxOf(config.pendingGraceSeconds, config.timeoutSeconds) * 1000L
 
         for (pod in pods) {
             val podName = pod.metadata?.name ?: continue
@@ -629,9 +655,20 @@ class K8sRuntimeProvider(
             if (phase == "Failed" || phase == "Succeeded") {
                 return false
             }
+            if (unschedulableReason(pod) != null) {
+                return false
+            }
             Thread.sleep(500)
         }
         return false
+    }
+
+    private fun unschedulableReason(pod: Pod?): String? {
+        val condition = pod?.status?.conditions?.firstOrNull { it.type == "PodScheduled" } ?: return null
+        if (condition.status == "False" && condition.reason == "Unschedulable") {
+            return condition.message?.takeIf { it.isNotBlank() } ?: "Unschedulable"
+        }
+        return null
     }
 
     /**

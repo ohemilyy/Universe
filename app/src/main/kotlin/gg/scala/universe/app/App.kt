@@ -114,6 +114,8 @@ class UniverseApplication {
 
             val enforcer = injector.getInstance(InstanceCountEnforcer::class.java)
             enforcer.start()
+
+            recoveryService.startPeriodicReconcile(60)
         }
     }
 
@@ -149,6 +151,7 @@ class UniverseApplication {
             if (mainConfiguration.isMasterNode) {
                 val enforcer = injector.getInstance(InstanceCountEnforcer::class.java)
                 enforcer.stop()
+                injector.getInstance(InstanceRecoveryService::class.java).stopPeriodicReconcile()
             }
 
             // Stop local instances (needs Hazelcast)

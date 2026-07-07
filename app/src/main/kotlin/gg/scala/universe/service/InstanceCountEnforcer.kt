@@ -33,6 +33,8 @@ class InstanceCountEnforcer @Inject constructor(
     @Volatile
     private var shuttingDown = false
 
+    private val spawnBackoff = SpawnBackoff()
+
     fun start() {
         if (!configuration.isMasterNode) {
             log("InstanceCountEnforcer disabled on non-master node", LogLevel.INFO)
@@ -63,6 +65,7 @@ class InstanceCountEnforcer @Inject constructor(
     private fun enforce() {
         if (shuttingDown) return
         try {
+            val now = System.currentTimeMillis()
             val configs = clusterStateService.configurations.values
             val initialInstances = clusterStateService.getAllInstances()
 
@@ -70,7 +73,7 @@ class InstanceCountEnforcer @Inject constructor(
             // freed, resource that never became ready) so they stop counting as active and can be
             // retried on this very tick.
             val stuck = InstanceLifecyclePolicy.staleCreating(
-                initialInstances, System.currentTimeMillis(), InstanceLifecyclePolicy.CREATING_TIMEOUT_MS
+                initialInstances, now, InstanceLifecyclePolicy.CREATING_TIMEOUT_MS
             )
             for (instance in stuck) {
                 log(
@@ -83,6 +86,7 @@ class InstanceCountEnforcer @Inject constructor(
                 if (instance.allocatedPort > 0) portAllocator.release(instance.allocatedPort)
                 clusterStateService.updateInstanceState(instance.id, InstanceState.OFFLINE)
             }
+            stuck.mapTo(HashSet()) { it.configurationName }.forEach { spawnBackoff.recordFailure(it, now) }
 
             // Re-read after reaping so the deficit reflects the freed-up slots.
             val allInstances = if (stuck.isEmpty()) initialInstances else clusterStateService.getAllInstances()
@@ -94,9 +98,23 @@ class InstanceCountEnforcer @Inject constructor(
                     it.configurationName == config.name &&
                     (it.state == InstanceState.ONLINE || it.state == InstanceState.CREATING)
                 }
+                val onlineCount = allInstances.count {
+                    it.configurationName == config.name && it.state == InstanceState.ONLINE
+                }
+                if (onlineCount >= config.minimumServiceCount) spawnBackoff.recordSuccess(config.name)
 
                 val deficit = if (config.static) min(config.minimumServiceCount - activeCount, 1) else config.minimumServiceCount - activeCount
                 if (deficit <= 0) continue
+
+                if (!spawnBackoff.ready(config.name, now)) {
+                    val retryInSec = ((spawnBackoff.nextAttemptMs(config.name) - now).coerceAtLeast(0)) / 1000
+                    log(
+                        "Config '${config.name}' is below minimum ($activeCount/${config.minimumServiceCount}) " +
+                        "but backing off after repeated spawn failures; next attempt in ${retryInSec}s",
+                        LogLevel.DEBUG
+                    )
+                    continue
+                }
 
                 log(
                     "Config '${config.name}' has $activeCount active instance(s), " +
@@ -118,6 +136,7 @@ class InstanceCountEnforcer @Inject constructor(
                         LogLevel.SUCCESS
                     )
                 }
+                spawnBackoff.recordFailure(config.name, now)
             }
         } catch (e: Exception) {
             log("InstanceCountEnforcer encountered an error: ${e.message}", LogLevel.ERROR)

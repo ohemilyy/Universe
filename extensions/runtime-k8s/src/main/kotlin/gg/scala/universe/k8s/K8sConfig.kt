@@ -27,6 +27,10 @@ data class K8sConfig(
      * as dead and cleaned up. Kept generous so slow image pulls aren't killed prematurely.
      */
     val pendingGraceSeconds: Int = 120,
+
+    val autoHeap: Boolean = true,
+    val heapFraction: Double = 0.75,
+    val minHeapMB: Int = 512,
     /**
      * Host filesystem path that corresponds to the Universe data directory.
      * Required when Universe itself runs inside a Docker container, because

@@ -118,7 +118,38 @@ class InstanceRecoveryService @Inject constructor(
         // Reconcile each runtime's actual resources against what Universe tracks. This deletes
         // post-restart orphaned resources that would otherwise hold ports and node capacity.
         // It runs before the enforcer starts spawning, so we never spawn into a dirty cluster.
-        reconcileRuntimes()
+        reconcile()
+    }
+
+    private val reconcileExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "universe-reconcile").apply { isDaemon = true }
+    }
+
+    @Volatile
+    private var reconcileShuttingDown = false
+
+    fun startPeriodicReconcile(intervalSeconds: Long) {
+        reconcileExecutor.scheduleAtFixedRate({
+            if (reconcileShuttingDown) return@scheduleAtFixedRate
+            try {
+                reconcile()
+            } catch (e: Exception) {
+                log("Periodic reconcile failed: ${e.message}", LogLevel.WARNING)
+            }
+        }, intervalSeconds, intervalSeconds, java.util.concurrent.TimeUnit.SECONDS)
+        log("Periodic runtime reconciliation started (interval=${intervalSeconds}s)", LogLevel.INFO)
+    }
+
+    fun stopPeriodicReconcile() {
+        reconcileShuttingDown = true
+        reconcileExecutor.shutdown()
+        try {
+            if (!reconcileExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                reconcileExecutor.shutdownNow()
+            }
+        } catch (_: InterruptedException) {
+            reconcileExecutor.shutdownNow()
+        }
     }
 
     /**
@@ -126,7 +157,7 @@ class InstanceRecoveryService @Inject constructor(
      * tracks, then reacts to the report: tracked instances whose resource was dead are marked
      * OFFLINE and have their port and node resources released.
      */
-    private fun reconcileRuntimes() {
+    fun reconcile() {
         val trackedIds = clusterStateService.getAllInstances()
             .filter { it.state == InstanceState.ONLINE || it.state == InstanceState.CREATING }
             .map { it.id }
@@ -189,7 +220,9 @@ class InstanceRecoveryService @Inject constructor(
             for (id in report.deadInstanceIds) {
                 val instance = clusterStateService.getInstance(id) ?: continue
                 portAllocator.release(instance.allocatedPort)
-                clusterStateService.removeNodeResources(instance.wrapperNodeId, instance.allocatedRamMB, instance.allocatedCpu)
+                if (instance.state == InstanceState.ONLINE) {
+                    clusterStateService.removeNodeResources(instance.wrapperNodeId, instance.allocatedRamMB, instance.allocatedCpu)
+                }
                 clusterStateService.updateInstanceState(id, InstanceState.OFFLINE)
                 log("Instance $id had a dead resource during reconcile; marked OFFLINE and released port ${instance.allocatedPort}", LogLevel.WARNING)
             }
