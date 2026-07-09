@@ -1,6 +1,7 @@
 package gg.scala.universe.k8s
 
 import com.google.inject.Inject
+import gg.scala.universe.cluster.ClusterDataProvider
 import gg.scala.universe.console.LogLevel
 import gg.scala.universe.console.log
 import gg.scala.universe.extension.Extension
@@ -19,11 +20,20 @@ class K8sExtension : Extension {
     @Inject
     private lateinit var templateVariableRegistry: TemplateVariableRegistry
 
+    @Inject
+    private lateinit var clusterDataProvider: ClusterDataProvider
+
     private lateinit var config: K8sConfig
 
     override fun onLoad() {
         config = K8sConfigLoader.load()
-        val provider = K8sRuntimeProvider(config)
+        // Pass the stable cluster/node identity so pods/services carry ownership labels and
+        // reconciliation never touches another cluster's resources in a shared namespace.
+        val provider = K8sRuntimeProvider(
+            config,
+            clusterDataProvider.getClusterName(),
+            clusterDataProvider.getLocalNodeId()
+        )
         runtimeRegistry.register(config.factoryName, provider)
         
         // Register K8s-specific template variables (%NAMESPACE%, %SERVICE_DNS%, etc.)

@@ -124,7 +124,7 @@ LUNA-3: implement RuntimeProvider interface for Docker extension
 
 ## Pull Request Process
 
-1. **Create a branch** from `develop` (or `main` for hotfixes)
+1. **Create a branch** from `develop` (or `production` for hotfixes)
 2. **Reference the YouTrack ticket** in your branch name and commits (e.g., `LUNA-42-feature-name`)
 3. **Ensure the build passes**: `./gradlew build`
 4. **Fill out the PR template** completely — all checklists must be addressed

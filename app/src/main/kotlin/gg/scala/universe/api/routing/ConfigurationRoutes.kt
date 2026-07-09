@@ -1,6 +1,9 @@
 package gg.scala.universe.api.routing
 
+import gg.scala.universe.console.LogLevel
+import gg.scala.universe.console.log
 import gg.scala.universe.hz.ClusterStateService
+import gg.scala.universe.service.ConfigValidation
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.call
@@ -36,8 +39,9 @@ fun Application.configureConfigurationRoutes(clusterStateService: ClusterStateSe
                     val name = call.parameters["name"]
                         ?: return@put call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing configuration name"))
 
-                    val config = call.receive<gg.scala.universe.schema.Configuration>()
-                    clusterStateService.putConfiguration(config.copy(name = name))
+                    val config = call.receive<gg.scala.universe.schema.Configuration>().copy(name = name)
+                    ConfigValidation.warnings(config).forEach { log(it, LogLevel.WARNING) }
+                    clusterStateService.putConfiguration(config)
                     call.respond(HttpStatusCode.NoContent)
                 }
 

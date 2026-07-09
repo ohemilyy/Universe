@@ -2,7 +2,7 @@ services:
 
   # Universe
   universe:
-    image: git.lunarlabs.dev/scala/universe:latest
+    image: ghcr.io/universeclouddev/universe:latest
     ports:
       - "127.0.0.1:6000:6000" # Map host port 6000 to container port 6000
       - "127.0.0.1:7000:7000" # Map host port 7000 to container port 7000

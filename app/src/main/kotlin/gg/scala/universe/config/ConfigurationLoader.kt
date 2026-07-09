@@ -49,6 +49,8 @@ object ConfigurationLoader {
             try {
                 val content = path.readText()
                 val configuration = gson.fromJson(content, Configuration::class.java)
+                gg.scala.universe.service.ConfigValidation.warnings(configuration)
+                    .forEach { log(it, LogLevel.WARNING) }
                 clusterStateService.putConfiguration(configuration)
                 loadedCount++
                 log("Loaded configuration '${configuration.name}' from $path")

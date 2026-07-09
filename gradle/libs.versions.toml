@@ -18,16 +18,16 @@ hazelcast = "5.7.0"
 ktor = "3.5.0"
 kotlinx-html = "0.12.0"
 docker-java = "3.7.1"
-aws-sdk = "2.46.8"
+aws-sdk = "2.46.10"
 jline = "4.1.3"
 logback = "1.5.32"
 k8s-client = "7.7.0"
 h2 = "2.4.240"
-mariadb = "3.5.8"
+mariadb = "3.5.9"
 postgres = "42.7.11"
 mongodb = "5.8.0"
 jedis = "7.5.2"
-jooq = "3.21.5"
+jooq = "3.21.6"
 jgit = "7.7.0.202606012155-r"
 micrometer = "1.17.0"
 micrometer-influx = "1.17.0"
@@ -39,6 +39,7 @@ folia = "1.21.8-R0.1-SNAPSHOT"
 bungeecord = "1.21-R0.5-SNAPSHOT"
 jda = "6.4.2"
 cloudDiscord = "1.0.0-beta.4"
+junit = "5.11.4"
 
 [libraries]
 # dependency download
@@ -95,6 +96,8 @@ logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "lo
 
 # fabric8 kubernetes client
 k8s-client = { module = "io.fabric8:kubernetes-client", version.ref = "k8s-client" }
+k8s-server-mock = { module = "io.fabric8:kubernetes-server-mock", version.ref = "k8s-client" }
+k8s-junit = { module = "io.fabric8:kubernetes-junit-jupiter", version.ref = "k8s-client" }
 
 # database
 h2 = { module = "com.h2database:h2", version.ref = "h2" }
@@ -128,6 +131,10 @@ bungeecord-api = { module = "net.md-5:bungeecord-api", version.ref = "bungeecord
 
 # discord
 jda = { module = "net.dv8tion:JDA", version.ref = "jda" }
+
+# testing
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
 
 # other
 

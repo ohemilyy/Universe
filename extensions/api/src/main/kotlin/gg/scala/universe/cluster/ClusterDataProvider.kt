@@ -18,4 +18,10 @@ interface ClusterDataProvider {
 
     /** Returns all instances including stopped/offline. */
     fun getAllInstances(): Collection<InstanceInfo>
+
+    /** The logical cluster name this node belongs to. Stable across restarts. */
+    fun getClusterName(): String
+
+    /** The stable logical id of the local node. Stable across restarts (not the Hazelcast UUID). */
+    fun getLocalNodeId(): String
 }

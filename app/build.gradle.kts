@@ -54,6 +54,14 @@ dependencies {
     // jOOQ for type-safe SQL building (with Kotlin extensions)
     runtimeDownload(libs.jooq)
     runtimeDownload(libs.jooq.kotlin)
+
+    // testing
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.platform.launcher)
+}
+
+tasks.withType<Test>().configureEach {
+    useJUnitPlatform()
 }
 
 tasks.shadowJar {

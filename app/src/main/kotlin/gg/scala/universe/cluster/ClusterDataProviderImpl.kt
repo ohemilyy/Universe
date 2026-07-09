@@ -2,6 +2,7 @@ package gg.scala.universe.cluster
 
 import com.google.inject.Inject
 import com.google.inject.Singleton
+import gg.scala.universe.config.UniverseMainConfiguration
 import gg.scala.universe.hz.ClusterStateService
 import gg.scala.universe.schema.Configuration
 import gg.scala.universe.schema.InstanceInfo
@@ -11,7 +12,8 @@ import gg.scala.universe.schema.InstanceInfo
  */
 @Singleton
 class ClusterDataProviderImpl @Inject constructor(
-    private val clusterStateService: ClusterStateService
+    private val clusterStateService: ClusterStateService,
+    private val configuration: UniverseMainConfiguration
 ) : ClusterDataProvider {
 
     override fun getConfigurations(): Collection<Configuration> {
@@ -25,4 +27,8 @@ class ClusterDataProviderImpl @Inject constructor(
     override fun getAllInstances(): Collection<InstanceInfo> {
         return clusterStateService.getAllInstances()
     }
+
+    override fun getClusterName(): String = configuration.clusterName
+
+    override fun getLocalNodeId(): String = configuration.nodeId
 }

@@ -27,6 +27,7 @@ import org.incendo.cloud.annotations.Command
 import org.incendo.cloud.annotation.specifier.FlagYielding
 import com.hazelcast.core.HazelcastInstance
 import gg.scala.universe.hz.nodeName
+import gg.scala.universe.hz.ownsInstance
 import kotlinx.coroutines.delay
 import org.incendo.cloud.annotations.Default
 import java.nio.file.Path
@@ -185,7 +186,7 @@ class ManagementCommands @Inject constructor(
             }
 
             val member = hazelcastInstance.cluster.members.firstOrNull {
-                it.uuid.toString() == instanceInfo.wrapperNodeId
+                it.ownsInstance(instanceInfo.wrapperNodeId)
             } ?: hazelcastInstance.cluster.localMember
 
             source.sendMessage("Created static instance '$configName' on node ${member.nodeName()}")
@@ -204,7 +205,7 @@ class ManagementCommands @Inject constructor(
             }
 
             val member = hazelcastInstance.cluster.members.firstOrNull {
-                it.uuid.toString() == instanceInfo.wrapperNodeId
+                it.ownsInstance(instanceInfo.wrapperNodeId)
             } ?: hazelcastInstance.cluster.localMember
 
             source.sendMessage(
@@ -225,7 +226,7 @@ class ManagementCommands @Inject constructor(
         }
 
         val member = hazelcastInstance.cluster.members.firstOrNull {
-            it.uuid.toString() == instance.wrapperNodeId
+            it.ownsInstance(instance.wrapperNodeId)
         } ?: hazelcastInstance.cluster.localMember
 
         taskDispatcher.dispatchStop(instanceId, member)
@@ -276,7 +277,7 @@ class ManagementCommands @Inject constructor(
         }
 
         val member = hazelcastInstance.cluster.members.firstOrNull {
-            it.uuid.toString() == instance.wrapperNodeId
+            it.ownsInstance(instance.wrapperNodeId)
         } ?: hazelcastInstance.cluster.localMember
 
         taskDispatcher.dispatchExecute(instanceId, command, member)
@@ -302,7 +303,7 @@ class ManagementCommands @Inject constructor(
 
         // Stop existing
         val member = hazelcastInstance.cluster.members.firstOrNull {
-            it.uuid.toString() == instance.wrapperNodeId
+            it.ownsInstance(instance.wrapperNodeId)
         } ?: hazelcastInstance.cluster.localMember
         taskDispatcher.dispatchStop(instanceId, member)
         source.sendMessage("Stopping instance $instanceId for restart...")
@@ -337,7 +338,7 @@ class ManagementCommands @Inject constructor(
         }
 
         val member = hazelcastInstance.cluster.members.firstOrNull {
-            it.uuid.toString() == instance.wrapperNodeId
+            it.ownsInstance(instance.wrapperNodeId)
         } ?: hazelcastInstance.cluster.localMember
 
         taskDispatcher.dispatchStop(instanceId, member)

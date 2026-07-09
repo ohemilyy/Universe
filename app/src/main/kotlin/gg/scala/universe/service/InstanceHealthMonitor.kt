@@ -6,6 +6,7 @@ import com.hazelcast.core.HazelcastInstance
 import gg.scala.universe.console.LogLevel
 import gg.scala.universe.console.log
 import gg.scala.universe.hz.ClusterStateService
+import gg.scala.universe.hz.stableNodeId
 import gg.scala.universe.runtime.PortAllocator
 import gg.scala.universe.runtime.RuntimeRegistry
 import gg.scala.universe.schema.InstanceState
@@ -58,7 +59,7 @@ class InstanceHealthMonitor @Inject constructor(
 
     private fun checkHealth() {
         try {
-            val localNodeId = hazelcastInstance.cluster.localMember.uuid.toString()
+            val localNodeId = hazelcastInstance.cluster.localMember.stableNodeId()
             val instances = clusterStateService.getAllInstances()
                 .filter { it.wrapperNodeId == localNodeId && it.state == InstanceState.ONLINE }
 

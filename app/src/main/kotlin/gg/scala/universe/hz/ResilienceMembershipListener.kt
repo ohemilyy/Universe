@@ -15,25 +15,27 @@ class ResilienceMembershipListener(
     }
 
     override fun memberRemoved(membershipEvent: MembershipEvent) {
-        val memberUuid = membershipEvent.member.uuid.toString()
-        log("Wrapper disconnected: $memberUuid", LogLevel.WARNING)
+        // Use the stable nodeId so instances are matched even though the member's UUID is
+        // gone — ownership is keyed on nodeId, not the volatile UUID.
+        val nodeId = membershipEvent.member.stableNodeId()
+        log("Wrapper disconnected: $nodeId", LogLevel.WARNING)
 
-        val affectedInstances = clusterStateService.getInstancesByWrapper(memberUuid)
+        val affectedInstances = clusterStateService.getInstancesByWrapper(nodeId)
         if (affectedInstances.isEmpty()) {
-            log("No instances were running on disconnected wrapper $memberUuid")
+            log("No instances were running on disconnected wrapper $nodeId")
             return
         }
 
         affectedInstances.forEach { instance ->
-            log("Marking instance ${instance.id} as OFFLINE (was on wrapper $memberUuid)", LogLevel.WARNING)
+            log("Marking instance ${instance.id} as OFFLINE (was on wrapper $nodeId)", LogLevel.WARNING)
             clusterStateService.updateInstanceState(instance.id, InstanceState.OFFLINE)
         }
 
         log("Marked ${affectedInstances.size} instance(s) as OFFLINE", LogLevel.WARNING)
 
         // Clear node resource tracking for the disconnected wrapper
-        clusterStateService.clearNodeResources(memberUuid)
-        log("Cleared resource tracking for node $memberUuid")
+        clusterStateService.clearNodeResources(nodeId)
+        log("Cleared resource tracking for node $nodeId")
     }
 
 }

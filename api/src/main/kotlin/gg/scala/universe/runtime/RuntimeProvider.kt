@@ -66,6 +66,27 @@ interface RuntimeProvider {
      * Used for instance recovery after node restart.
      */
     fun listRunningInstances(): List<String> = emptyList()
+
+    /**
+     * Reconciles this runtime's actual managed resources against the set of instance ids
+     * Universe still tracks. Implementations should:
+     * - delete resources Universe no longer tracks (post-restart zombies),
+     * - delete tracked-but-dead resources (failed / stuck pending),
+     * - rebuild any internal bookkeeping from live state,
+     * - report which tracked instances are confirmed running vs. dead.
+     *
+     * Runtimes that keep no external state (tmux/screen/process) need no reconciliation.
+     *
+     * @param trackedInstanceIds Instance ids Universe currently has records for.
+     */
+    fun reconcile(trackedInstanceIds: Set<String>): RuntimeReconcileReport = RuntimeReconcileReport()
+
+    /**
+     * Returns the schedulable capacity this runtime sees for the local node, or null if the
+     * runtime cannot report it (callers fall back to configured limits). Used to base
+     * scheduling on real node Allocatable rather than static configuration.
+     */
+    fun queryNodeAllocatable(): NodeAllocatable? = null
     /**
      * Returns the reachable host address for the given instance.
      * Used by the proxy (or other services) to connect to this instance.

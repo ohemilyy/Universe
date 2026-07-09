@@ -4,6 +4,8 @@ import com.hazelcast.core.HazelcastInstance
 import com.hazelcast.cluster.Member
 import gg.scala.universe.hz.ClusterStateService
 import gg.scala.universe.hz.nodeName
+import gg.scala.universe.hz.ownsInstance
+import gg.scala.universe.hz.stableNodeId
 import gg.scala.universe.hz.task.TaskDispatcher
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
@@ -26,7 +28,7 @@ fun Application.configureClusterRoutes(
         route("/api/cluster") {
             get("/nodes") {
                 val nodes = hazelcastInstance.cluster.members.map { member ->
-                    val nodeId = member.uuid.toString()
+                    val nodeId = member.stableNodeId()
                     val resources = clusterStateService.getNodeResources(nodeId)
                     mapOf(
                         "id" to nodeId,
@@ -48,7 +50,7 @@ fun Application.configureClusterRoutes(
                     ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing node ID"))
 
                 val member = hazelcastInstance.cluster.members.firstOrNull {
-                    it.uuid.toString() == nodeId
+                    it.ownsInstance(nodeId)
                 } ?: return@get call.respond(HttpStatusCode.NotFound, mapOf("error" to "Node not found"))
 
                 val resources = clusterStateService.getNodeResources(nodeId)
@@ -73,7 +75,7 @@ fun Application.configureClusterRoutes(
                     ?: return@post call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing node ID"))
 
                 val member = hazelcastInstance.cluster.members.firstOrNull {
-                    it.uuid.toString() == nodeId
+                    it.ownsInstance(nodeId)
                 } ?: return@post call.respond(HttpStatusCode.NotFound, mapOf("error" to "Node not found"))
 
                 val request = call.receive<ClusterCommandRequest>()
