@@ -18,15 +18,15 @@ A single-JAR orchestrator for deploying and managing application instances acros
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        Master Node                          │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │  Ktor REST  │  │   Hazelcast │  │   Console Commands  │ │
-│  │    API      │  │   IMap/Exec │  │   (Cloud v2)        │ │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
+│  │  Ktor REST  │  │   Hazelcast │  │   Console Commands  │  │
+│  │    API      │  │   IMap/Exec │  │   (Cloud v2)        │  │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘  │
 │         │                │                    │             │
 │         ▼                ▼                    ▼             │
-│  POST /api/instances  DeployInstanceTask   instance create │
-│  PUT /api/instances   StopInstanceTask     instance stop   │
-│  POST /api/commands   TemplateSyncTask     template sync   │
+│  POST /api/instances  DeployInstanceTask   instance create  │
+│  PUT /api/instances   StopInstanceTask     instance stop    │
+│  POST /api/commands   TemplateSyncTask     template sync    │
 └─────────────────────────────────────────────────────────────┘
                               │
                               │ Hazelcast Cluster
