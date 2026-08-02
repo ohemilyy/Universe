@@ -16,7 +16,6 @@
           </compositeBuild>
         </compositeConfiguration>
         <option name="externalProjectPath" value="$PROJECT_DIR$" />
-        <option name="gradleHome" value="" />
         <option name="modules">
           <set>
             <option value="$PROJECT_DIR$" />
@@ -29,6 +28,7 @@
             <option value="$PROJECT_DIR$/extensions/db-mongodb" />
             <option value="$PROJECT_DIR$/extensions/db-postgres" />
             <option value="$PROJECT_DIR$/extensions/db-redis" />
+            <option value="$PROJECT_DIR$/extensions/deployment-artifacts" />
             <option value="$PROJECT_DIR$/extensions/discord" />
             <option value="$PROJECT_DIR$/extensions/example" />
             <option value="$PROJECT_DIR$/extensions/gitops" />
