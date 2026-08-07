@@ -1,6 +1,6 @@
 package gg.scala.universe.schema
 
-data class PortRange(val min: Int, val max: Int)
+data class PortRange(val min: Int, val max: Int, val strategy: String = "random")
 
 data class AdditionalPort(
     val port: Int,

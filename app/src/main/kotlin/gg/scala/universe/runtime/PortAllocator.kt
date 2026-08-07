@@ -13,7 +13,8 @@ import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Scans local port ranges and allocates the lowest available port.
+ * Scans local port ranges and allocates an available port, in random order
+ * by default or lowest-first when the range's strategy is "sequential".
  *
  * Ports are tracked in-memory to avoid allocating the same port twice
  * within the same JVM instance. The actual availability test is performed
@@ -32,7 +33,8 @@ class PortAllocator @Inject constructor(
     private val allocatedPorts = ConcurrentHashMap.newKeySet<Int>()
 
     /**
-     * Finds and locks the lowest available port in the given [range].
+     * Finds and locks an available port in the given [range], scanning in
+     * random or sequential order per the range's strategy.
      *
      * Checks, in order:
      * 1. Local in-memory allocations (this JVM)
@@ -49,7 +51,13 @@ class PortAllocator @Inject constructor(
             .map { it.allocatedPort }
             .toSet()
 
-        for (port in range.min..range.max) {
+        val candidates = if ("sequential".equals(range.strategy, ignoreCase = true)) {
+            (range.min..range.max).toList()
+        } else {
+            (range.min..range.max).shuffled()
+        }
+
+        for (port in candidates) {
             // 1. Check local in-memory allocations
             if (allocatedPorts.contains(port)) {
                 log("Port $port skipped — already allocated locally", LogLevel.DEBUG)

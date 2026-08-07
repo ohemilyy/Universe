@@ -14,6 +14,62 @@ On its first startup, the extension creates the following configuration file:
 
 All values provided through `targetPath` must be relative to the Universe working directory. Absolute paths are not supported.
 
+### Template paths — TL;DR
+
+Set `targetPath` to the exact file that should be replaced inside a template:
+
+```text
+templates/<group>/<name>/plugins/<plugin>.jar
+templates/<group>/<name>/<server>.jar
+```
+
+Examples:
+
+```json
+"targetPath": "templates/lobby/default/plugins/LobbyPlugin.jar"
+```
+
+```json
+"targetPath": "templates/survival/default/server.jar"
+```
+
+The downloaded artifact keeps the name from `targetPath`. For example, an asset matching `LobbyPlugin-1.4.2.jar` is installed as `LobbyPlugin.jar` in the example above.
+
+To deploy the same artifact into multiple templates, add one source entry per target:
+
+```json
+"forgejo": [
+  {
+    "id": "lobby-plugin-default",
+    "enabled": true,
+    "serverUrl": "https://code.example.com",
+    "owner": "minecraft",
+    "repository": "lobby-plugin",
+    "assetPattern": "LobbyPlugin-*.jar",
+    "targetPath": "templates/lobby/default/plugins/LobbyPlugin.jar",
+    "branch": "production",
+    "releaseTag": null,
+    "includePrereleases": false,
+    "token": null
+  },
+  {
+    "id": "lobby-plugin-ranked",
+    "enabled": true,
+    "serverUrl": "https://code.example.com",
+    "owner": "minecraft",
+    "repository": "lobby-plugin",
+    "assetPattern": "LobbyPlugin-*.jar",
+    "targetPath": "templates/lobby/ranked/plugins/LobbyPlugin.jar",
+    "branch": "production",
+    "releaseTag": null,
+    "includePrereleases": false,
+    "token": null
+  }
+]
+```
+
+Template updates are used by newly created instances. The extension does not restart or hot-update instances that are already running.
+
 ```json
 {
   "enabled": true,
