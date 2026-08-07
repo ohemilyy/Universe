@@ -34,20 +34,29 @@ tasks.jib {
     dependsOn(tasks.shadowJar)
 }
 
+// ── Jib configuration ─────────────────────────────────────────
+// For CI (ghcr.io): set JIB_IMAGE, JIB_USERNAME, JIB_PASSWORD, JIB_TAGS env vars
+// For local dev: uses default git.lunarlabs.dev registry
 jib {
+    from {
+        image = "amazoncorretto:21"
+    }
     to {
-        image = "git.lunarlabs.dev/scala/universe:dev"
+        image = System.getenv("JIB_IMAGE") ?: "git.lunarlabs.dev/scala/universe:dev"
         setTags(provider {
-            val git = project.extra["git"] as Map<*, *>
-//            val commitIdFull = git["git.commit.id"].toString()
-            val branchName = git["git.branch"].toString()
-
-            setOf("dev", /* commitIdFull, */ branchName, "latest")
+            val envTags = System.getenv("JIB_TAGS")
+            if (envTags != null) {
+                envTags.split(",").map { it.trim() }.toSet()
+            } else {
+                val git = project.extra["git"] as Map<*, *>
+                val branchName = git["git.branch"].toString()
+                setOf("dev", branchName, "latest")
+            }
         })
 
         auth {
-            username = System.getenv("REGISTRY_USER") ?: ""
-            password = System.getenv("REGISTRY_PASS") ?: ""
+            username = System.getenv("JIB_USERNAME") ?: System.getenv("REGISTRY_USER") ?: ""
+            password = System.getenv("JIB_PASSWORD") ?: System.getenv("REGISTRY_PASS") ?: ""
         }
     }
     container {
@@ -69,7 +78,6 @@ jib {
         )
 
         creationTime = provider {
-            // Retrieve the 'git' extra property and cast it to a Map
             val git = project.extra["git"] as Map<*, *>
             git["git.commit.time"].toString()
         }
@@ -77,17 +85,21 @@ jib {
         workingDirectory = "/data"
 
         labels = mapOf(
-            "org.opencontainers.image.source" to "https://git.lunarlabs.dev/scala/universe"
+            "org.opencontainers.image.source" to (
+                System.getenv("GITHUB_REPOSITORY")
+                    ?.let { "https://github.com/$it" }
+                    ?: "https://git.lunarlabs.dev/scala/universe"
+                ),
+            "org.opencontainers.image.description" to "Universe — Distributed single-JAR cluster orchestrator",
+            "org.opencontainers.image.licenses" to "UNLICENSED"
         )
-
-        // Tell Jib to copy the ShadowJar into the /app directory of the image
-        extraDirectories {
-            paths {
-                path {
-                    setFrom(tasks.shadowJar.get().archiveFile.get().asFile.parentFile)
-                    into = "/app"
-                    includes = listOf(tasks.shadowJar.get().archiveFileName.get())
-                }
+    }
+    extraDirectories {
+        paths {
+            path {
+                setFrom(tasks.shadowJar.get().archiveFile.get().asFile.parentFile.toPath())
+                into = "/app"
+                includes = listOf(tasks.shadowJar.get().archiveFileName.get())
             }
         }
     }

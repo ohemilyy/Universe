@@ -35,7 +35,7 @@ Create `./extensions/metrics-influxdb/config.json`:
 ```yaml
 services:
   universe:
-    image: git.lunarlabs.dev/scala/universe:latest
+    image: ghcr.io/universeclouddev/universe:latest
     volumes:
       - ./data:/data
 

@@ -28,7 +28,7 @@ rootProject.name = "universe"
 registerSubProjects(
     root = "extensions",
     prefix = "extension",
-    subProjects = arrayOf("api", "example", "runtime-docker", "runtime-k8s", "storage-s3", "db-postgres", "db-mongodb", "db-redis", "metrics-prometheus", "metrics-influxdb", "gitops", "argocd", "discord", "tailscale")
+    subProjects = arrayOf("api", "example", "runtime-docker", "runtime-k8s", "storage-s3", "db-postgres", "db-mongodb", "db-redis", "metrics-prometheus", "metrics-influxdb", "gitops", "argocd", "discord", "tailscale", "deployment-artifacts")
 )
 
 include(":loader")

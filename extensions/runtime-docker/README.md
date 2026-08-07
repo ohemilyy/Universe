@@ -10,7 +10,7 @@ If Universe itself runs inside Docker Compose (which is the recommended deployme
 
 ```yaml
 universe:
-  image: git.lunarlabs.dev/scala/universe:latest
+  image: ghcr.io/universeclouddev/universe:latest
   volumes:
     - ./data:/data
     # REQUIRED: Allow Universe to control Docker on the host

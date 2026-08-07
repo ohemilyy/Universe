@@ -6,7 +6,7 @@ package gg.scala.universe.k8s
 data class K8sConfig(
     val factoryName: String = "kube",
     val namespace: String = "default",
-    val image: String = "azul-zulu:25-jdk-alpine",
+    val image: String = "azul-zulu:21-jdk-alpine",
     val imagePullPolicy: String = "IfNotPresent",
     val workingDir: String = "/app",
     val restartPolicy: String = "Never",
