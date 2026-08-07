@@ -47,10 +47,11 @@ subprojects {
         compileOnly(kotlin("stdlib"))
     }
 
+    val javaTargets = if (name in setOf("minecraft-api", "minecraft-legacy")) 8 to JvmTarget.JVM_1_8 else 21 to JvmTarget.JVM_21
     kotlin {
-        jvmToolchain(21)
+        jvmToolchain(javaTargets.first)
         compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_21)
+            jvmTarget.set(javaTargets.second)
         }
     }
 

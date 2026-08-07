@@ -11,12 +11,6 @@ dependencies {
     implementation(libs.gson)
 }
 
-java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(21)
-    }
-}
-
 tasks {
     shadowJar {
         archiveClassifier.set("")
