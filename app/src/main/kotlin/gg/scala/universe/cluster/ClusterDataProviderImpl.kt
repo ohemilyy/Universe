@@ -19,7 +19,7 @@ class ClusterDataProviderImpl @Inject constructor(
     }
 
     override fun getActiveInstances(): Collection<InstanceInfo> {
-        return clusterStateService.getActiveInstances()
+        return clusterStateService.getVisibleInstances()
     }
 
     override fun getAllInstances(): Collection<InstanceInfo> {

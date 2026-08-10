@@ -3,6 +3,10 @@
 //}
 
 dependencies {
+    testImplementation(libs.kotlin.test.junit5)
+    testImplementation(libs.hazelcast)
+    testRuntimeOnly(libs.junit.jupiter.engine)
+
     // api
     implementation(project(":api")) {
         exclude(group = "org.jetbrains.kotlin")

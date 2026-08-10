@@ -5,8 +5,8 @@ import com.google.inject.Singleton
 import gg.scala.universe.console.LogLevel
 import gg.scala.universe.console.log
 import gg.scala.universe.hz.ClusterStateService
-import gg.scala.universe.schema.InstanceState
 import gg.scala.universe.schema.PortRange
+import gg.scala.universe.service.occupiesPort
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -45,9 +45,9 @@ class PortAllocator @Inject constructor(
      * @return The allocated port number, or `null` if none are available.
      */
     fun allocate(range: PortRange): Int? {
-        // Build a snapshot of ports already in use by active instances across the cluster
+        // Build a snapshot of ports held by instances across the cluster.
         val clusterUsedPorts = clusterStateService.getAllInstances()
-            .filter { it.state == InstanceState.ONLINE || it.state == InstanceState.CREATING }
+            .filter { it.state.occupiesPort }
             .map { it.allocatedPort }
             .toSet()
 

@@ -37,10 +37,10 @@ class ClusterStateService @Inject constructor(
     }
 
     /**
-     * Returns all instances, filtering out those that have been OFFLINE or STOPPED
+     * Returns all visible instances, filtering out those that have been OFFLINE or STOPPED
      * for more than [staleThresholdMs] (default 15s for OFFLINE, 10s for STOPPED).
      */
-    fun getActiveInstances(staleThresholdMs: Long = 15000): Collection<InstanceInfo> {
+    fun getVisibleInstances(staleThresholdMs: Long = 15000): Collection<InstanceInfo> {
         val now = System.currentTimeMillis()
         return instances.values.filter { instance ->
             when (instance.state) {

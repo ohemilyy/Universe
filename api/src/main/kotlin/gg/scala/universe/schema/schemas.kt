@@ -11,6 +11,7 @@ data class AdditionalPort(
 enum class InstanceState {
     CREATING,
     ONLINE,
+    STOPPING,
     OFFLINE,
     STOPPED
 }

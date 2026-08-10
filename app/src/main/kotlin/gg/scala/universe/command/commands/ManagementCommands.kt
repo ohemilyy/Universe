@@ -128,7 +128,7 @@ class ManagementCommands @Inject constructor(
 
     @Command("instance|instances list")
     fun instanceList(source: CommandSource) {
-        val instances = clusterStateService.getActiveInstances()
+        val instances = clusterStateService.getVisibleInstances()
         if (instances.isEmpty()) {
             source.sendMessage("No instances found.")
             return
