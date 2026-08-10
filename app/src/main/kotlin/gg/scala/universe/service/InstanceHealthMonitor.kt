@@ -9,6 +9,8 @@ import gg.scala.universe.hz.ClusterStateService
 import gg.scala.universe.hz.task.InstanceWorkspace
 import gg.scala.universe.runtime.PortAllocator
 import gg.scala.universe.runtime.RuntimeRegistry
+import gg.scala.universe.runtime.RuntimeRecoveryInspector
+import gg.scala.universe.runtime.RuntimeResourceState
 import gg.scala.universe.schema.InstanceState
 import java.nio.file.Files
 import java.util.Comparator
@@ -66,24 +68,44 @@ class InstanceHealthMonitor @Inject constructor(
             if (instances.isEmpty()) return
 
             for (instance in instances) {
-                val config = clusterStateService.getConfiguration(instance.configurationName)
-                // Use the runtime stored at instance creation time so config reloads
-                // don't cause us to check the wrong runtime provider.
-                val runtimeKey = instance.runtime
-                val runtimeProvider = runtimeRegistry.get(runtimeKey)
-
-                if (runtimeProvider == null) {
+                try {
+                    val config = clusterStateService.getConfiguration(instance.configurationName)
+                    val runtimeKey = instance.runtime
+                    val runtimeProvider = runtimeRegistry.get(runtimeKey)
+                    if (runtimeProvider == null) {
+                        log("No runtime provider '$runtimeKey' for ${instance.id}; retaining ownership", LogLevel.WARNING)
+                        continue
+                    }
+                    val workingDirectory = if (config?.static == true) {
+                        workspace.staticConfiguration(config.name)
+                    } else workspace.dynamicInstance(instance.id)
+                    val runtimeState = if (runtimeProvider is RuntimeRecoveryInspector) {
+                        runtimeProvider.inspectRecovered(
+                            instance.id,
+                            instance.processPid,
+                            workingDirectory
+                        )
+                    } else if (runtimeProvider.isRunning(instance.id)) {
+                        RuntimeResourceState.RUNNING
+                    } else RuntimeResourceState.ABSENT
+                    when (runtimeState) {
+                        RuntimeResourceState.RUNNING -> Unit
+                        RuntimeResourceState.ABSENT -> markOffline(instance, config)
+                        RuntimeResourceState.TERMINAL -> {
+                            runtimeProvider.stop(instance.id)
+                            markOffline(instance, config)
+                        }
+                        RuntimeResourceState.PRESENT_TRANSITIONAL,
+                        RuntimeResourceState.UNKNOWN -> log(
+                            "Runtime state for ${instance.id} is $runtimeState; retaining ownership",
+                            LogLevel.WARNING
+                        )
+                    }
+                } catch (failure: Exception) {
                     log(
-                        "No runtime provider '$runtimeKey' for instance ${instance.id}; " +
-                            "retaining lifecycle ownership because runtime absence is unconfirmed",
+                        "Health discovery failed for ${instance.id}: ${failure.message}; retaining ownership",
                         LogLevel.WARNING
                     )
-                    continue
-                }
-
-                if (!runtimeProvider.isRunning(instance.id)) {
-                    log("Instance ${instance.id} is no longer running (runtime=$runtimeKey), marking OFFLINE", LogLevel.WARNING)
-                    markOffline(instance, config)
                 }
             }
         } catch (e: Exception) {

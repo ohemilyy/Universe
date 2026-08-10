@@ -3,22 +3,39 @@ package gg.scala.universe.runtime
 import com.google.inject.Singleton
 import gg.scala.universe.console.LogLevel
 import gg.scala.universe.console.log
+import gg.scala.universe.schema.Configuration
+import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
-/**
- * [RuntimeProvider] that runs the instance command directly as a subprocess.
- *
- * This is the preferred runtime for Docker containers where screen/tmux
- * are not available. Stdout and stderr are redirected to log files in
- * the instance working directory.
- */
-@Singleton
-class ProcessRuntimeProvider : RuntimeProvider {
+internal interface ProcessIdentityLookup {
+    fun find(pid: Long): ProcessHandle?
+    fun matchesWorkingDirectory(pid: Long, expected: Path): Boolean
+}
 
+private object SystemProcessIdentityLookup : ProcessIdentityLookup {
+    override fun find(pid: Long): ProcessHandle? = ProcessHandle.of(pid).orElse(null)
+
+    override fun matchesWorkingDirectory(pid: Long, expected: Path): Boolean {
+        val cwd = Path.of("/proc", pid.toString(), "cwd")
+        if (!Files.exists(cwd)) return false
+        return try {
+            Files.isSameFile(cwd, expected.toAbsolutePath().normalize())
+        } catch (_: Exception) {
+            false
+        }
+    }
+}
+
+/** Direct subprocess runtime with durable PID recovery after wrapper restart. */
+@Singleton
+class ProcessRuntimeProvider internal constructor(
+    private val processLookup: ProcessIdentityLookup = SystemProcessIdentityLookup
+) : RuntimeProvider, RuntimeRecoveryInspector {
     private val processes = ConcurrentHashMap<String, Process>()
+    private val recoveredHandles = ConcurrentHashMap<String, ProcessHandle>()
 
     override fun start(
         instanceId: String,
@@ -27,116 +44,90 @@ class ProcessRuntimeProvider : RuntimeProvider {
         command: String,
         ramMB: Int,
         cpu: Int,
-        configuration: gg.scala.universe.schema.Configuration,
-        environmentVariables: Map<String, String>?,
+        configuration: Configuration,
+        environmentVariables: Map<String, String>?
     ): ProcessHandle {
-        if (command.isBlank()) {
-            throw IllegalArgumentException("Command is blank for instance $instanceId")
-        }
-
-        val logOut = workingDir.resolve("stdout.log").toFile()
-        val logErr = workingDir.resolve("stderr.log").toFile()
-
-        // Build command with resource limit fallback prefix
-        val wrappedCommand = CgroupResourceEnforcer.buildFallbackPrefix(ramMB, cpu) + command
-
-        val processBuilder = ProcessBuilder("bash", "-c", wrappedCommand)
-            .directory(workingDir.toFile())
-            .redirectOutput(ProcessBuilder.Redirect.to(logOut))
-            .redirectError(ProcessBuilder.Redirect.to(logErr))
+        require(command.isNotBlank()) { "Command is blank for instance $instanceId" }
+        val builder = ProcessBuilder(
+            "bash", "-c", CgroupResourceEnforcer.buildFallbackPrefix(ramMB, cpu) + command
+        ).directory(workingDir.toFile())
+            .redirectOutput(ProcessBuilder.Redirect.to(workingDir.resolve("stdout.log").toFile()))
+            .redirectError(ProcessBuilder.Redirect.to(workingDir.resolve("stderr.log").toFile()))
             .redirectInput(ProcessBuilder.Redirect.PIPE)
-
-        if (!environmentVariables.isNullOrEmpty()) {
-            processBuilder.environment().putAll(environmentVariables)
-        }
-
-        val process = processBuilder.start()
-
+        if (!environmentVariables.isNullOrEmpty()) builder.environment().putAll(environmentVariables)
+        val process = builder.start()
         processes[instanceId] = process
-
-        // Attempt cgroup v2 enforcement
-        val cgroupPath = CgroupResourceEnforcer.createCgroup(instanceId, ramMB, cpu)
-        if (cgroupPath != null) {
-            CgroupResourceEnforcer.movePidToCgroup(process.pid(), cgroupPath)
+        recoveredHandles[instanceId] = process.toHandle()
+        CgroupResourceEnforcer.createCgroup(instanceId, ramMB, cpu)?.let {
+            CgroupResourceEnforcer.movePidToCgroup(process.pid(), it)
         }
-
         log("Started process for instance $instanceId (PID ${process.pid()})", LogLevel.SUCCESS)
         return process.toHandle()
     }
 
+    override fun inspectRecovered(
+        instanceId: String,
+        processPid: Long?,
+        workingDirectory: Path
+    ): RuntimeResourceState {
+        processPid ?: return RuntimeResourceState.UNKNOWN
+        val handle = processLookup.find(processPid) ?: return RuntimeResourceState.ABSENT
+        if (!handle.isAlive) return RuntimeResourceState.ABSENT
+        if (!processLookup.matchesWorkingDirectory(processPid, workingDirectory)) {
+            return RuntimeResourceState.UNKNOWN
+        }
+        recoveredHandles[instanceId] = handle
+        return RuntimeResourceState.RUNNING
+    }
+
     override fun stop(instanceId: String) {
-        val process = processes[instanceId] ?: return
-        process.destroy()
+        val process = processes[instanceId]
+        val handle = process?.toHandle() ?: recoveredHandles[instanceId] ?: return
+        if (handle.isAlive) {
+            handle.destroy()
+            awaitExit(instanceId, handle, force = false)
+            if (handle.isAlive) {
+                handle.destroyForcibly()
+                awaitExit(instanceId, handle, force = true)
+            }
+        }
+        check(!handle.isAlive) { "Process for instance $instanceId is still running" }
+        CgroupResourceEnforcer.cleanupCgroup(instanceId)
+        process?.let { processes.remove(instanceId, it) }
+        recoveredHandles.remove(instanceId, handle)
+        log("Stopped process for instance $instanceId")
+    }
+
+    private fun awaitExit(instanceId: String, handle: ProcessHandle, force: Boolean) {
         try {
-            process.onExit().get(STOP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            handle.onExit().get(STOP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         } catch (failure: InterruptedException) {
             Thread.currentThread().interrupt()
-            throw IllegalStateException(
-                "Interrupted while confirming process teardown for instance $instanceId",
-                failure
-            )
+            throw IllegalStateException("Interrupted while confirming process teardown for $instanceId", failure)
         } catch (_: TimeoutException) {
-            process.destroyForcibly()
-            try {
-                process.onExit().get(STOP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            } catch (failure: InterruptedException) {
-                Thread.currentThread().interrupt()
-                throw IllegalStateException(
-                    "Interrupted while confirming forced process teardown for instance $instanceId",
-                    failure
-                )
-            } catch (failure: Exception) {
-                throw IllegalStateException(
-                    "Failed to confirm process teardown for instance $instanceId",
-                    failure
-                )
-            }
+            if (force) throw IllegalStateException("Failed to confirm forced process teardown for $instanceId")
         } catch (failure: Exception) {
-            throw IllegalStateException(
-                "Failed to confirm process teardown for instance $instanceId",
-                failure
-            )
+            throw IllegalStateException("Failed to confirm process teardown for $instanceId", failure)
         }
-        check(!process.isAlive) { "Process for instance $instanceId is still running" }
-        CgroupResourceEnforcer.cleanupCgroup(instanceId)
-        processes.remove(instanceId, process)
-        log("Stopped process for instance $instanceId")
     }
 
     override fun executeCommand(instanceId: String, command: String) {
         val process = processes[instanceId]
-            ?: return log("No process found for instance $instanceId", LogLevel.WARNING)
-
+            ?: return log("Recovered process $instanceId has no attachable stdin", LogLevel.WARNING)
         process.outputStream.bufferedWriter().use {
             it.write(command)
             it.newLine()
             it.flush()
         }
-        log("Executed command on instance $instanceId: $command")
     }
 
-    override fun isRunning(instanceId: String): Boolean {
-        val process = processes[instanceId] ?: return false
-        return process.isAlive
-    }
+    override fun isRunning(instanceId: String): Boolean =
+        processes[instanceId]?.isAlive ?: recoveredHandles[instanceId]?.isAlive ?: false
 
-    override fun listRunningInstances(): List<String> {
-        return processes.keys.toList()
-    }
+    override fun listRunningInstances(): List<String> =
+        (processes.keys + recoveredHandles.keys).distinct()
 
-    override fun getLogs(instanceId: String, lines: Int): List<String> {
-        val process = processes[instanceId] ?: return emptyList()
-        val workingDir = process.info().commandLine()
-            .map { java.nio.file.Paths.get(it).parent }
-            .orElse(null) ?: return emptyList()
-        val stdout = workingDir.resolve("stdout.log")
-        val stderr = workingDir.resolve("stderr.log")
-        return when {
-            java.nio.file.Files.exists(stdout) -> stdout.toFile().readLines().takeLast(lines)
-            java.nio.file.Files.exists(stderr) -> stderr.toFile().readLines().takeLast(lines)
-            else -> emptyList()
-        }
-    }
+    override fun getLogs(instanceId: String, lines: Int): List<String> = emptyList()
 
     private companion object {
         const val STOP_TIMEOUT_SECONDS = 10L

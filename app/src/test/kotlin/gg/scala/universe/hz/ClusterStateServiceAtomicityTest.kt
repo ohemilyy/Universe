@@ -296,6 +296,41 @@ class ClusterStateServiceAtomicityTest {
         assertEquals(InstanceState.OFFLINE, state.getInstance("old002")?.state)
     }
 
+    @Test
+    fun `restart transfers exact reservation without opening a capacity race`() {
+        val creating = instance("old001", InstanceState.CREATING, lastHeartbeat = 1)
+        assertTrue(state.reserveCreatingInstance(creating, 1, maxRamMB = 64, maxCpu = 1))
+        val stopping = creating.copy(state = InstanceState.STOPPING, lastHeartbeat = 2)
+        assertTrue(state.transitionLifecycle(creating, 1, stopping, 2))
+
+        val stopped = state.completeInstanceTerminationForRestart(stopping, 2, 3, 3)!!
+        assertEquals(64, state.getNodeResources("node-1").usedRamMB)
+        assertFalse(
+            state.reserveCreatingInstance(
+                instance("new002", InstanceState.CREATING, lastHeartbeat = 3),
+                1,
+                maxRamMB = 64,
+                maxCpu = 1
+            )
+        )
+
+        val restarted = stopped.copy(state = InstanceState.CREATING, lastHeartbeat = 4)
+        assertTrue(state.reserveRestartCreating(stopped, restarted, 3))
+        assertEquals(64, state.getNodeResources("node-1").usedRamMB)
+    }
+
+    @Test
+    fun `shutdown claim cannot act on a newer lifecycle incarnation`() {
+        val creating = instance("old001", InstanceState.CREATING, lastHeartbeat = 1)
+        assertTrue(state.reserveCreatingInstance(creating, 1, 1024, 100))
+        val online = creating.copy(state = InstanceState.ONLINE, lastHeartbeat = 2)
+        assertTrue(state.transitionLifecycle(creating, 1, online, 2))
+
+        assertNull(state.claimForShutdown(creating, 1, now = 3))
+        assertEquals(online, state.getInstance(online.id))
+        assertEquals(2, state.getLifecycleGeneration(online.id))
+    }
+
     private fun instance(id: String, state: InstanceState, lastHeartbeat: Long) = InstanceInfo(
         id = id,
         configurationName = "site",

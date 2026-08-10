@@ -88,8 +88,8 @@ class TmuxRuntimeProvider : RuntimeProvider {
             val output = process.inputStream.bufferedReader().readLines()
             process.waitFor()
             output.filter { it.startsWith("universe-") }.map { it.removePrefix("universe-") }
-        } catch (_: Exception) {
-            emptyList()
+        } catch (failure: Exception) {
+            throw IllegalStateException("Failed to discover tmux sessions", failure)
         }
     }
 

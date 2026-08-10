@@ -8,7 +8,10 @@ import gg.scala.universe.console.log
 import gg.scala.universe.hz.ClusterStateService
 import gg.scala.universe.hz.task.InstanceWorkspace
 import gg.scala.universe.runtime.PortAllocator
+import gg.scala.universe.runtime.RuntimeRecoveryInspector
 import gg.scala.universe.runtime.RuntimeRegistry
+import gg.scala.universe.runtime.RuntimeResourceState
+import gg.scala.universe.schema.Configuration
 import gg.scala.universe.schema.InstanceInfo
 import gg.scala.universe.schema.InstanceState
 import gg.scala.universe.util.json.Serializers
@@ -16,16 +19,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Comparator
 
-/**
- * Recovers instances that were running before a node restart.
- *
- * On startup, this service:
- * 1. Checks Hazelcast for instances assigned to this node and verifies they are still running.
- * 2. Scans the filesystem for [./running/] and [./static/] state files and verifies they are still running.
- * 3. Registers recovered instances in [ClusterStateService] and tracks their resources.
- *
- * Runs before [InstanceCountEnforcer] to prevent duplicate instance creation.
- */
+/** Recovers wrapper-owned runtime resources before count reconciliation starts. */
 @Singleton
 class InstanceRecoveryService @Inject constructor(
     private val clusterStateService: ClusterStateService,
@@ -34,190 +28,179 @@ class InstanceRecoveryService @Inject constructor(
     private val portAllocator: PortAllocator,
     private val workspace: InstanceWorkspace = InstanceWorkspace()
 ) {
-
     fun recover() {
         val localNodeId = hazelcastInstance.cluster.localMember.uuid.toString()
         log("Recovering instances for node $localNodeId...")
-
         val recovered = mutableSetOf<String>()
 
-        // 1. Recover from Hazelcast (instances we already knew about)
-        val hazelcastInstances = clusterStateService.getAllInstances()
+        clusterStateService.getAllInstances()
             .filter { it.wrapperNodeId == localNodeId && it.state == InstanceState.ONLINE }
+            .forEach { if (verifyAndRegister(it)) recovered += it.id }
 
-        for (instance in hazelcastInstances) {
-            if (verifyAndRegister(instance)) {
-                recovered.add(instance.id)
-            }
-        }
-
-        // 2. Recover from filesystem state files (for full cluster restarts)
-        val runningDir = workspace.runningRoot()
-        val staticDir = workspace.staticRoot()
-        for (stateRoot in listOf(runningDir, staticDir)) {
-            if (!Files.exists(stateRoot)) continue
-            Files.list(stateRoot).use { stream ->
-                stream.filter { Files.isDirectory(it) }
-                    .forEach { dir ->
-                        val stateFile = dir.resolve(".universe-state.json")
-                        if (Files.exists(stateFile)) {
-                            try {
-                                val json = Files.readString(stateFile)
-                                val instance = Serializers.GSON.fromJson(json, InstanceInfo::class.java)
-                                if (
-                                    instance != null && instance.id !in recovered &&
-                                    verifyAndRegister(instance)
-                                ) {
-                                    recovered.add(instance.id)
-                                }
-                            } catch (e: Exception) {
-                                log("Failed to parse state file in $dir: ${e.message}", LogLevel.WARNING)
-                            }
-                        }
+        val roots = listOf(workspace.runningRoot(), workspace.staticRoot())
+        roots.forEach { root ->
+            if (!Files.exists(root)) return@forEach
+            Files.list(root).use { stream ->
+                stream.filter(Files::isDirectory).forEach { directory ->
+                    readState(directory)?.takeIf { it.id !in recovered }?.let {
+                        if (verifyAndRegister(it)) recovered += it.id
                     }
+                }
             }
         }
 
-        // 3. Check runtime providers for any instances not yet recovered
-        for ((runtimeKey, provider) in runtimeRegistry.getAll()) {
-            val instanceIds = try {
+        runtimeRegistry.getAll().forEach { (runtimeKey, provider) ->
+            val ids = try {
                 provider.listRunningInstances()
             } catch (failure: Exception) {
-                log(
-                    "Could not discover instances from runtime '$runtimeKey': ${failure.message}",
-                    LogLevel.WARNING
-                )
-                continue
+                log("Could not discover instances from runtime '$runtimeKey': ${failure.message}", LogLevel.WARNING)
+                return@forEach
             }
-            for (id in instanceIds) {
-                if (recovered.contains(id)) continue
-
-                // Try to find state file for this instance
-                val stateFile = findStateFile(id, runningDir, staticDir)
-                val instance = if (stateFile != null && Files.exists(stateFile)) {
-                    try {
-                        val json = Files.readString(stateFile)
-                        Serializers.GSON.fromJson(json, InstanceInfo::class.java)
-                    } catch (_: Exception) {
-                        null
-                    }
-                } else {
-                    // Kubernetes workloads can survive a wrapper restart even
-                    // without a local state directory. The pod label supplies
-                    // the id; reuse its durable master-side metadata.
-                    clusterStateService.getInstance(id)
-                }
-
-                if (instance != null && verifyAndRegister(instance)) {
-                    recovered.add(instance.id)
-                } else {
-                    // Unknown running instance — can't recover without metadata, log and skip
+            ids.filterNot(recovered::contains).forEach { id ->
+                val persisted = findStateFile(id, roots)?.let(::readStateFile)
+                    ?: clusterStateService.getInstance(id)
+                if (persisted != null && verifyAndRegister(persisted)) {
+                    recovered += id
+                } else if (persisted == null) {
                     log("Found unknown running instance '$id' via runtime '$runtimeKey', skipping recovery", LogLevel.WARNING)
                 }
             }
         }
 
-        if (recovered.isEmpty()) {
-            log("No instances to recover")
-        } else {
+        if (recovered.isEmpty()) log("No instances to recover") else {
             log("Recovered ${recovered.size} instance(s): ${recovered.joinToString(", ")}", LogLevel.SUCCESS)
         }
     }
 
-    /**
-     * Verifies that the instance is actually running and registers it.
-     * Returns true if successfully recovered.
-     */
-    private fun verifyAndRegister(instance: InstanceInfo): Boolean {
-        val config = clusterStateService.getConfiguration(instance.configurationName)
-        // Use the runtime stored at instance creation time so config reloads
-        // don't cause us to check the wrong runtime provider.
-        val runtimeKey = instance.runtime
-        val provider = runtimeRegistry.get(runtimeKey)
-
+    private fun verifyAndRegister(candidate: InstanceInfo): Boolean {
+        val expected = clusterStateService.getInstance(candidate.id)
+        val durable = expected ?: candidate
+        if (durable.state == InstanceState.STOPPING || durable.state == InstanceState.STOPPED) {
+            log("Recovery rejected terminal/barrier snapshot for ${durable.id}", LogLevel.WARNING)
+            return false
+        }
+        val expectedGeneration = expected?.let { clusterStateService.getLifecycleGeneration(it.id) }
+        val config = clusterStateService.getConfiguration(durable.configurationName)
+        val provider = runtimeRegistry.get(durable.runtime)
         if (provider == null) {
-            log(
-                "No runtime provider '$runtimeKey' for recovered instance ${instance.id}; " +
-                    "leaving lifecycle ownership unchanged",
-                LogLevel.WARNING
-            )
+            log("No runtime provider '${durable.runtime}' for recovered instance ${durable.id}; leaving ownership unchanged", LogLevel.WARNING)
             return false
         }
-
-        val running = try {
-            provider.isRunning(instance.id)
+        val workingDirectory = if (config?.static == true) {
+            workspace.staticConfiguration(config.name)
+        } else workspace.dynamicInstance(durable.id)
+        val state = try {
+            if (provider is RuntimeRecoveryInspector) {
+                provider.inspectRecovered(durable.id, durable.processPid, workingDirectory)
+            } else if (provider.isRunning(durable.id)) RuntimeResourceState.RUNNING
+            else RuntimeResourceState.ABSENT
         } catch (failure: Exception) {
-            log(
-                "Could not confirm runtime state for recovered instance ${instance.id}: " +
-                    "${failure.message}; leaving lifecycle ownership unchanged",
-                LogLevel.WARNING
-            )
-            return false
-        }
-        if (!running) {
-            log("Instance ${instance.id} is no longer running, cleaning up", LogLevel.WARNING)
-            cleanupDeadInstance(instance, config)
+            log("Could not confirm runtime state for ${durable.id}: ${failure.message}; retaining ownership", LogLevel.WARNING)
             return false
         }
 
-        // Instance is running — register it
-        val updated = instance.copy(
+        when (state) {
+            RuntimeResourceState.PRESENT_TRANSITIONAL, RuntimeResourceState.UNKNOWN -> {
+                log("Runtime state for ${durable.id} is $state; retaining lifecycle ownership", LogLevel.WARNING)
+                return false
+            }
+            RuntimeResourceState.TERMINAL -> {
+                try {
+                    provider.stop(durable.id)
+                    val confirmed = if (provider is RuntimeRecoveryInspector) {
+                        provider.inspectRecovered(durable.id, durable.processPid, workingDirectory)
+                    } else if (provider.isRunning(durable.id)) RuntimeResourceState.RUNNING
+                    else RuntimeResourceState.ABSENT
+                    if (confirmed != RuntimeResourceState.ABSENT) return false
+                } catch (failure: Exception) {
+                    log("Failed to delete terminal runtime ${durable.id}: ${failure.message}", LogLevel.WARNING)
+                    return false
+                }
+                cleanupDeadInstance(durable, config, expectedGeneration)
+                return false
+            }
+            RuntimeResourceState.ABSENT -> {
+                cleanupDeadInstance(durable, config, expectedGeneration)
+                return false
+            }
+            RuntimeResourceState.RUNNING -> Unit
+        }
+
+        if (!portAllocator.reserve(durable.allocatedPort)) {
+            log("Recovery port ${durable.allocatedPort} is already locally owned; retaining ${durable.id}", LogLevel.WARNING)
+            return false
+        }
+        val generation = maxOf(1L, expectedGeneration ?: 0L)
+        val updated = durable.copy(
             wrapperNodeId = hazelcastInstance.cluster.localMember.uuid.toString(),
             state = InstanceState.ONLINE,
             lastHeartbeat = System.currentTimeMillis()
         )
-        val generation = maxOf(1L, clusterStateService.getLifecycleGeneration(instance.id))
-        if (!clusterStateService.recoverInstance(updated, generation)) {
-            log("Recovery of instance ${instance.id} was superseded by cleanup", LogLevel.WARNING)
+        if (!clusterStateService.recoverInstance(expected, expectedGeneration, updated, generation)) {
+            portAllocator.release(durable.allocatedPort)
+            log("Recovery of ${durable.id} lost its exact lifecycle claim", LogLevel.WARNING)
             return false
         }
-
-        // Re-allocate port to mark it as used
-        portAllocator.reserve(instance.allocatedPort)
-
-        log("Recovered instance ${instance.id} (config=${instance.configurationName}, port=${instance.allocatedPort})", LogLevel.SUCCESS)
+        log("Recovered ${durable.id} (config=${durable.configurationName}, port=${durable.allocatedPort})", LogLevel.SUCCESS)
         return true
     }
 
-    private fun cleanupDeadInstance(instance: InstanceInfo, config: gg.scala.universe.schema.Configuration?) {
-        portAllocator.release(instance.allocatedPort)
-        if (config?.static != true) {
-            val workingDir = workspace.dynamicInstance(instance.id)
-            try {
-                if (Files.exists(workingDir)) {
-                    Files.walk(workingDir)
-                        .sorted(Comparator.reverseOrder())
-                        .forEach { Files.deleteIfExists(it) }
-                }
-            } catch (_: Exception) {
-                // ignored
-            }
+    private fun cleanupDeadInstance(
+        instance: InstanceInfo,
+        config: Configuration?,
+        expectedGeneration: Long?
+    ) {
+        if (expectedGeneration == null || expectedGeneration <= 0L) {
+            log("Legacy/unowned instance ${instance.id} is absent; retaining metadata", LogLevel.WARNING)
+            return
         }
-
+        val (claimed, generation) = clusterStateService.claimForShutdown(
+            instance, expectedGeneration
+        ) ?: return
+        portAllocator.release(claimed.allocatedPort)
+        if (config?.static != true) deleteDirectory(workspace.dynamicInstance(claimed.id))
         clusterStateService.completeInstanceTermination(
-            expectedInstance = instance,
-            expectedGeneration = clusterStateService.getLifecycleGeneration(instance.id),
+            expectedInstance = claimed,
+            expectedGeneration = generation,
             finalState = InstanceState.OFFLINE
         )
     }
 
-    private fun findStateFile(id: String, runningDir: Path, staticDir: Path): Path? {
-        val dynamic = runningDir.resolve(id).resolve(".universe-state.json")
-        if (Files.exists(dynamic)) return dynamic
-        if (!Files.exists(staticDir)) return null
-        return Files.list(staticDir).use { stream ->
-            stream.filter { Files.isDirectory(it) }
-                .map { it.resolve(".universe-state.json") }
-                .filter { Files.exists(it) }
-                .filter { path ->
-                    runCatching {
-                        Serializers.GSON.fromJson(
-                            Files.readString(path), InstanceInfo::class.java
-                        )?.id == id
-                    }.getOrDefault(false)
-                }
-                .findFirst()
-                .orElse(null)
+    private fun deleteDirectory(directory: Path) {
+        try {
+            if (Files.exists(directory)) Files.walk(directory).use { paths ->
+                paths.sorted(Comparator.reverseOrder()).forEach(Files::deleteIfExists)
+            }
+        } catch (failure: Exception) {
+            log("Failed to clean recovered directory $directory: ${failure.message}", LogLevel.WARNING)
         }
+    }
+
+    private fun readState(directory: Path): InstanceInfo? =
+        readStateFile(directory.resolve(".universe-state.json"))
+
+    private fun readStateFile(path: Path): InstanceInfo? {
+        if (!Files.exists(path)) return null
+        return try {
+            Serializers.GSON.fromJson(Files.readString(path), InstanceInfo::class.java)
+        } catch (failure: Exception) {
+            log("Failed to parse state file $path: ${failure.message}", LogLevel.WARNING)
+            null
+        }
+    }
+
+    private fun findStateFile(id: String, roots: List<Path>): Path? {
+        roots.forEach { root ->
+            if (!Files.exists(root)) return@forEach
+            Files.list(root).use { stream ->
+                val found = stream.filter(Files::isDirectory)
+                    .map { it.resolve(".universe-state.json") }
+                    .filter(Files::exists)
+                    .filter { readStateFile(it)?.id == id }
+                    .findFirst().orElse(null)
+                if (found != null) return found
+            }
+        }
+        return null
     }
 }

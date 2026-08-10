@@ -14,8 +14,19 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class PortAllocatorConcurrencyTest {
+    @Test
+    fun `recovery reservation reports an existing local owner`() {
+        val allocator = PortAllocator(ClusterStateService(hazelcast))
+        val port = ServerSocket(0).use { it.localPort }
+
+        assertTrue(allocator.reserve(port))
+        assertFalse(allocator.reserve(port))
+    }
+
     private lateinit var hazelcast: HazelcastInstance
 
     @BeforeTest

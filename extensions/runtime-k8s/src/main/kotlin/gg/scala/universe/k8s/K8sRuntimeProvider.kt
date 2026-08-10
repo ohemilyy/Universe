@@ -3,6 +3,8 @@ package gg.scala.universe.k8s
 import gg.scala.universe.console.LogLevel
 import gg.scala.universe.console.log
 import gg.scala.universe.runtime.RuntimeProvider
+import gg.scala.universe.runtime.RuntimeRecoveryInspector
+import gg.scala.universe.runtime.RuntimeResourceState
 import io.fabric8.kubernetes.api.model.Container
 import io.fabric8.kubernetes.api.model.ContainerBuilder
 import io.fabric8.kubernetes.api.model.EnvVarBuilder
@@ -41,7 +43,7 @@ class K8sRuntimeProvider private constructor(
     private val config: K8sConfig,
     providedClient: KubernetesClient?,
     @Suppress("UNUSED_PARAMETER") useProvidedClient: Boolean
-) : RuntimeProvider {
+) : RuntimeProvider, RuntimeRecoveryInspector {
 
     constructor(config: K8sConfig) : this(config, null, false)
 
@@ -297,53 +299,71 @@ class K8sRuntimeProvider private constructor(
 
     override fun stop(instanceId: String) {
         val k8s = requireClient()
-        val podName = discoverPodName(k8s, instanceId) ?: return
-        var gracefulFailure: Exception? = null
-        try {
-            // Delete pod first (this will also delete the service via ownerReference)
-            k8s.pods().inNamespace(config.namespace).withName(podName)
-                .withTimeoutInMillis(60.seconds.inWholeMilliseconds).delete()
-        } catch (e: Exception) {
-            gracefulFailure = e
-            // Pod stuck in Terminating — force delete
-            log("Pod '$podName' didn't terminate gracefully, force deleting...", LogLevel.WARNING)
+        val podName = discoverPodName(k8s, instanceId)
+        if (podName != null) {
+            var gracefulFailure: Exception? = null
             try {
                 k8s.pods().inNamespace(config.namespace).withName(podName)
-                    .withGracePeriod(0).delete()
-            } catch (e2: Exception) {
-                throw IllegalStateException(
-                    "Failed to delete K8s pod '$podName' for instance $instanceId",
-                    e2
-                ).also { it.addSuppressed(gracefulFailure) }
+                    .withTimeoutInMillis(60.seconds.inWholeMilliseconds).delete()
+            } catch (e: Exception) {
+                gracefulFailure = e
+                log("Pod '$podName' didn't terminate gracefully, force deleting...", LogLevel.WARNING)
+                try {
+                    k8s.pods().inNamespace(config.namespace).withName(podName)
+                        .withGracePeriod(0).delete()
+                } catch (forceFailure: Exception) {
+                    throw IllegalStateException(
+                        "Failed to delete K8s pod '$podName' for instance $instanceId",
+                        forceFailure
+                    ).also { it.addSuppressed(gracefulFailure) }
+                }
             }
-        }
 
-        if (!waitForPodAbsent(k8s, config.namespace, podName, config.timeoutSeconds)) {
-            try {
-                k8s.pods().inNamespace(config.namespace).withName(podName)
-                    .withGracePeriod(0).delete()
-            } catch (forceFailure: Exception) {
-                throw IllegalStateException(
-                    "K8s pod '$podName' still exists and force deletion failed",
-                    forceFailure
-                )
-            }
             if (!waitForPodAbsent(k8s, config.namespace, podName, config.timeoutSeconds)) {
-                throw IllegalStateException(
+                try {
+                    k8s.pods().inNamespace(config.namespace).withName(podName)
+                        .withGracePeriod(0).delete()
+                } catch (forceFailure: Exception) {
+                    throw IllegalStateException("K8s pod '$podName' still exists and force deletion failed", forceFailure)
+                }
+                check(waitForPodAbsent(k8s, config.namespace, podName, config.timeoutSeconds)) {
                     "K8s pod '$podName' still exists after confirmed deletion attempts"
-                )
+                }
             }
+            podNames.remove(instanceId, podName)
         }
-        podNames.remove(instanceId, podName)
-        log("Stopped K8s pod '$podName' for instance $instanceId")
 
-        // Fallback: manually delete the service if ownerReference didn't work
+        val serviceName = "universe-$instanceId"
         try {
-            val serviceName = "universe-$instanceId"
             k8s.services().inNamespace(config.namespace).withName(serviceName).delete()
-            log("Deleted service '$serviceName' for instance $instanceId")
+        } catch (failure: Exception) {
+            throw IllegalStateException("Failed to delete K8s service '$serviceName'", failure)
+        }
+        check(waitForServiceAbsent(k8s, config.namespace, serviceName, config.timeoutSeconds)) {
+            "K8s service '$serviceName' still exists after deletion"
+        }
+        log("Stopped K8s resources for instance $instanceId")
+    }
+
+    override fun inspectRecovered(
+        instanceId: String,
+        processPid: Long?,
+        workingDirectory: Path
+    ): RuntimeResourceState {
+        val k8s = try { requireClient() } catch (_: Exception) { return RuntimeResourceState.UNKNOWN }
+        return try {
+            val podName = discoverPodName(k8s, instanceId) ?: return RuntimeResourceState.ABSENT
+            val pod = k8s.pods().inNamespace(config.namespace).withName(podName).get()
+                ?: return RuntimeResourceState.ABSENT
+            podNames[instanceId] = podName
+            when (pod.status?.phase) {
+                "Running" -> RuntimeResourceState.RUNNING
+                "Pending" -> RuntimeResourceState.PRESENT_TRANSITIONAL
+                "Succeeded", "Failed" -> RuntimeResourceState.TERMINAL
+                else -> RuntimeResourceState.UNKNOWN
+            }
         } catch (_: Exception) {
-            // Service may already be deleted by ownerReference
+            RuntimeResourceState.UNKNOWN
         }
     }
 
@@ -417,9 +437,8 @@ class K8sRuntimeProvider private constructor(
     }
 
     override fun listRunningInstances(): List<String> {
-        val k8s = client ?: return emptyList()
-        return try {
-            k8s.pods().inNamespace(config.namespace)
+        val k8s = requireClient()
+        return k8s.pods().inNamespace(config.namespace)
                 .withLabel("app", "universe")
                 .list().items
                 .mapNotNull { pod ->
@@ -427,9 +446,6 @@ class K8sRuntimeProvider private constructor(
                         pod.metadata?.name?.let { podName -> podNames[id] = podName }
                     }
                 }
-        } catch (_: Exception) {
-            emptyList()
-        }
     }
 
     /**
@@ -482,6 +498,20 @@ class K8sRuntimeProvider private constructor(
             Thread.sleep(100)
         } while (System.currentTimeMillis() < deadline)
         return false
+    }
+
+    private fun waitForServiceAbsent(
+        k8s: KubernetesClient,
+        namespace: String,
+        name: String,
+        timeoutSeconds: Int
+    ): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutSeconds.coerceAtLeast(1) * 1000L
+        do {
+            if (k8s.services().inNamespace(namespace).withName(name).get() == null) return true
+            Thread.sleep(100)
+        } while (System.currentTimeMillis() < deadline)
+        return k8s.services().inNamespace(namespace).withName(name).get() == null
     }
 
     private fun waitForPodPhase(k8s: KubernetesClient, namespace: String, name: String, targetPhase: String, timeoutSeconds: Int): Boolean {

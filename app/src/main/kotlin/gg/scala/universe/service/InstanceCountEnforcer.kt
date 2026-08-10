@@ -158,21 +158,20 @@ class InstanceCountEnforcer @Inject constructor(
     }
 
     private fun reapStaleCreating(instanceId: String, now: Long) {
-        val instances = clusterStateService.instances
-        instances.lock(instanceId)
-        try {
-            val instance = instances[instanceId] ?: return
-            if (
-                instance.state == InstanceState.CREATING &&
-                isStale(instance.lastHeartbeat, now, CREATING_TIMEOUT_MS)
-            ) {
+        val instance = clusterStateService.getInstance(instanceId) ?: return
+        if (
+            instance.state == InstanceState.CREATING &&
+            isStale(instance.lastHeartbeat, now, CREATING_TIMEOUT_MS)
+        ) {
+            val generation = clusterStateService.getLifecycleGeneration(instanceId)
+            if (clusterStateService.hasDeploymentCleanup(instanceId, generation)) {
+                clusterStateService.markDeploymentCleanupRequired(instance, generation, now)
+            } else {
                 clusterStateService.cancelCreatingInstance(
                     instance,
-                    clusterStateService.getLifecycleGeneration(instanceId)
+                    generation
                 )
             }
-        } finally {
-            instances.unlock(instanceId)
         }
     }
 
@@ -190,6 +189,15 @@ class InstanceCountEnforcer @Inject constructor(
             !isStale(instance.lastHeartbeat, now, STOPPING_TIMEOUT_MS) ||
             (!targetVerifiedUnavailable && instance.wrapperNodeId in liveWrapperIds)
         ) {
+            return
+        }
+
+        val generation = clusterStateService.getLifecycleGeneration(instanceId)
+        if (clusterStateService.hasDeploymentCleanup(instanceId, generation)) {
+            log(
+                "Retaining cleanup-required instance $instanceId until runtime absence is confirmed",
+                LogLevel.WARNING
+            )
             return
         }
 

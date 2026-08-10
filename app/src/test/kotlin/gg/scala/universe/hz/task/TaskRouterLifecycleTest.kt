@@ -13,6 +13,7 @@ import gg.scala.universe.schema.Configuration
 import gg.scala.universe.schema.InstanceInfo
 import gg.scala.universe.schema.InstanceState
 import gg.scala.universe.schema.PortRange
+import gg.scala.universe.service.InstanceLifecycleCoordinator
 import gg.scala.universe.task.DeployInstanceTask
 import gg.scala.universe.task.StopInstanceTask
 import gg.scala.universe.template.TemplateManager
@@ -50,6 +51,7 @@ class TaskRouterLifecycleTest {
     private lateinit var runtime: RecordingRuntimeProvider
     private lateinit var router: TaskRouter
     private lateinit var configuration: Configuration
+    private lateinit var coordinator: InstanceLifecycleCoordinator
     private var singlePort: Int = 0
 
     @BeforeTest
@@ -66,6 +68,7 @@ class TaskRouterLifecycleTest {
         state = ClusterStateService(hazelcastInstance)
         portAllocator = PortAllocator(state)
         runtime = RecordingRuntimeProvider()
+        coordinator = InstanceLifecycleCoordinator()
 
         val runtimeRegistry = RuntimeRegistryImpl().apply { register("fake", runtime) }
         val variableRegistry = TemplateVariableRegistryImpl()
@@ -76,7 +79,8 @@ class TaskRouterLifecycleTest {
             TemplateManager(variableRegistry, TemplateStorageRegistryImpl()),
             variableRegistry,
             hazelcastInstance,
-            InstanceWorkspace(tempDir)
+            InstanceWorkspace(tempDir),
+            coordinator
         )
 
         singlePort = ServerSocket(0).use { it.localPort }
@@ -285,6 +289,51 @@ class TaskRouterLifecycleTest {
         assertEquals(InstanceState.STOPPING, state.getInstance("old001")?.state)
         assertTrue(singlePort in portAllocator.getLocalAllocations())
         assertEquals(configuration.ramMB, state.getNodeResources(creatingInstance("x", 0).wrapperNodeId).usedRamMB)
+    }
+
+    @Test
+    fun `failed deployment teardown becomes cleanup required stopping ownership`() {
+        queueCreating("new001")
+        runtime.failHostLookup = true
+        runtime.failStop = true
+
+        router.route(DeployInstanceTask("new001", configuration.name, expectedGeneration = 1))
+
+        val retained = assertNotNull(state.getInstance("new001"))
+        assertEquals(InstanceState.STOPPING, retained.state)
+        assertEquals(singlePort, retained.allocatedPort)
+        assertTrue(singlePort in portAllocator.getLocalAllocations())
+        assertTrue(state.hasDeploymentCleanup("new001", 2))
+        assertEquals(configuration.ramMB, state.getNodeResources(retained.wrapperNodeId).usedRamMB)
+    }
+
+    @Test
+    fun `shutdown quiescing wins a deploy waiting on the shared lifecycle lock`() {
+        queueCreating("new001")
+        val lockEntered = CountDownLatch(1)
+        val releaseLock = CountDownLatch(1)
+        val deployStarted = CountDownLatch(1)
+        val lockHolder = CompletableFuture.runAsync {
+            coordinator.withInstance("new001") {
+                lockEntered.countDown()
+                check(releaseLock.await(5, TimeUnit.SECONDS))
+            }
+        }
+        assertTrue(lockEntered.await(5, TimeUnit.SECONDS))
+        val deploy = CompletableFuture.runAsync {
+            deployStarted.countDown()
+            router.route(DeployInstanceTask("new001", configuration.name, expectedGeneration = 1))
+        }
+        assertTrue(deployStarted.await(5, TimeUnit.SECONDS))
+
+        coordinator.beginShutdown()
+        releaseLock.countDown()
+        lockHolder.get(5, TimeUnit.SECONDS)
+        deploy.get(5, TimeUnit.SECONDS)
+
+        assertEquals(InstanceState.CREATING, state.getInstance("new001")?.state)
+        assertTrue(runtime.operations.isEmpty())
+        assertEquals(0, coordinator.trackedLockCount())
     }
 
     @Test

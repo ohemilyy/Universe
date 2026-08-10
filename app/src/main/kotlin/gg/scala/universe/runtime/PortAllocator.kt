@@ -104,9 +104,12 @@ class PortAllocator @Inject constructor(
      * Marks a port as used without checking availability.
      * Used during instance recovery to prevent duplicate allocation.
      */
-    fun reserve(port: Int) {
-        allocatedPorts.add(port)
-        log("Reserved port $port (recovered)")
+    fun reserve(port: Int): Boolean {
+        val reserved = allocatedPorts.add(port)
+        if (reserved) {
+            log("Reserved port $port (recovered)")
+        }
+        return reserved
     }
 
     /**

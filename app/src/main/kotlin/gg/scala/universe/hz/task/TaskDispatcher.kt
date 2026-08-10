@@ -145,21 +145,13 @@ class TaskDispatcher @Inject constructor(
 
         return awaitSubmission(
             targetMember = targetMember,
-            submission = submission,
-            stoppingInstance = stoppingInstance,
-            originalInstance = originalInstance,
-            stoppingGeneration = stoppingGeneration,
-            originalGeneration = originalGeneration
+            submission = submission
         )
     }
 
     private fun awaitSubmission(
         targetMember: Member,
-        submission: Future<String>,
-        stoppingInstance: InstanceInfo,
-        originalInstance: InstanceInfo,
-        stoppingGeneration: Long,
-        originalGeneration: Long
+        submission: Future<String>
     ): StopDispatchResult {
         return try {
             submission.get(STOP_SUBMISSION_ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)
@@ -168,19 +160,10 @@ class TaskDispatcher @Inject constructor(
             StopDispatchResult.DISPATCHED
         } catch (failure: InterruptedException) {
             Thread.currentThread().interrupt()
-            restoreTransitionIfCurrent(
-                stoppingInstance, originalInstance, stoppingGeneration, originalGeneration
-            )
             StopDispatchResult.SUBMISSION_FAILED
         } catch (failure: CancellationException) {
-            restoreTransitionIfCurrent(
-                stoppingInstance, originalInstance, stoppingGeneration, originalGeneration
-            )
             submissionFailureResult(targetMember, failure)
         } catch (failure: ExecutionException) {
-            restoreTransitionIfCurrent(
-                stoppingInstance, originalInstance, stoppingGeneration, originalGeneration
-            )
             submissionFailureResult(targetMember, failure.cause ?: failure)
         }
     }

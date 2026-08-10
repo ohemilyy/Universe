@@ -17,6 +17,13 @@ internal data class InstanceResourceReservation(
     val cpu: Int
 )
 
+internal data class DeploymentCleanupOwnership(
+    val generation: Long,
+    val allocatedPort: Int,
+    val runtime: String,
+    val runtimeStartAttempted: Boolean
+)
+
 class ClusterStateService @Inject constructor(
     private val hazelcastInstance: HazelcastInstance
 ) {
@@ -37,6 +44,9 @@ class ClusterStateService @Inject constructor(
 
     private val resourceReservations: IMap<String, InstanceResourceReservation>
         get() = hazelcastInstance.getMap("instanceResourceReservations")
+
+    private val deploymentCleanups: IMap<String, DeploymentCleanupOwnership>
+        get() = hazelcastInstance.getMap("instanceDeploymentCleanups")
 
     fun getConfiguration(name: String): Configuration? {
         return configurations[name]
@@ -79,6 +89,13 @@ class ClusterStateService @Inject constructor(
                 if (reservation.generation != expectedGeneration) return@executeTransaction false
                 txReservations.put(id, reservation.copy(generation = updatedGeneration))
             }
+            val txDeployments = context.getMap<String, DeploymentCleanupOwnership>(
+                "instanceDeploymentCleanups"
+            )
+            txDeployments.getForUpdate(id)?.let { cleanup ->
+                if (cleanup.generation != expectedGeneration) return@executeTransaction false
+                txDeployments.put(id, cleanup.copy(generation = updatedGeneration))
+            }
             txGenerations.put(id, updatedGeneration)
             txInstances.put(id, updatedInstance)
             true
@@ -101,6 +118,24 @@ class ClusterStateService @Inject constructor(
         } finally {
             map.unlock(expected.id)
         }
+    }
+
+    internal fun claimForShutdown(
+        expected: InstanceInfo,
+        expectedGeneration: Long,
+        now: Long = System.currentTimeMillis()
+    ): Pair<InstanceInfo, Long>? {
+        if (expectedGeneration <= 0L || expected.state == InstanceState.STOPPED) return null
+        if (expected.state == InstanceState.STOPPING) {
+            return if (isCurrentLifecycle(expected, expectedGeneration, InstanceState.STOPPING)) {
+                expected to expectedGeneration
+            } else null
+        }
+        val claimed = expected.copy(state = InstanceState.STOPPING, lastHeartbeat = now)
+        val generation = expectedGeneration + 1
+        return if (transitionLifecycle(expected, expectedGeneration, claimed, generation)) {
+            claimed to generation
+        } else null
     }
 
     /**
@@ -155,9 +190,7 @@ class ClusterStateService @Inject constructor(
     internal fun reserveRestartCreating(
         expectedTerminal: InstanceInfo,
         creating: InstanceInfo,
-        generation: Long,
-        maxRamMB: Int = Int.MAX_VALUE,
-        maxCpu: Int = Int.MAX_VALUE
+        generation: Long
     ): Boolean {
         require(expectedTerminal.id == creating.id)
         require(expectedTerminal.state == InstanceState.STOPPED)
@@ -166,42 +199,45 @@ class ClusterStateService @Inject constructor(
         return hazelcastInstance.executeTransaction(options) { context ->
             val txInstances = context.getMap<String, InstanceInfo>("instances")
             if (txInstances.getForUpdate(creating.id) != expectedTerminal) return@executeTransaction false
+            val txGenerations = context.getMap<String, Long>("instanceLifecycleGenerations")
+            if ((txGenerations.getForUpdate(creating.id) ?: 0L) != generation) {
+                return@executeTransaction false
+            }
             val txReservations = context.getMap<String, InstanceResourceReservation>("instanceResourceReservations")
-            if (txReservations.getForUpdate(creating.id) != null) return@executeTransaction false
-            val txResources = context.getMap<String, NodeResources>("nodeResources")
-            val current = txResources.getForUpdate(creating.wrapperNodeId) ?: NodeResources()
+            val reservation = txReservations.getForUpdate(creating.id) ?: return@executeTransaction false
             if (
-                current.usedRamMB + creating.allocatedRamMB > maxRamMB ||
-                current.usedCpu + creating.allocatedCpu > maxCpu
+                reservation.generation != generation ||
+                reservation.nodeId != creating.wrapperNodeId ||
+                reservation.ramMB != creating.allocatedRamMB ||
+                reservation.cpu != creating.allocatedCpu
             ) return@executeTransaction false
-            txResources.put(
-                creating.wrapperNodeId,
-                NodeResources(
-                    current.usedRamMB + creating.allocatedRamMB,
-                    current.usedCpu + creating.allocatedCpu
-                )
-            )
-            txReservations.put(
-                creating.id,
-                InstanceResourceReservation(
-                    generation,
-                    creating.wrapperNodeId,
-                    creating.allocatedRamMB,
-                    creating.allocatedCpu
-                )
-            )
-            context.getMap<String, Long>("instanceLifecycleGenerations").put(creating.id, generation)
             txInstances.put(creating.id, creating)
             true
         }
     }
 
-    /** Rebinds a surviving runtime to this wrapper and owns its accounting exactly once. */
-    internal fun recoverInstance(instance: InstanceInfo, generation: Long): Boolean {
+    /** Rebinds a surviving runtime only if the durable snapshot is still exact. */
+    internal fun recoverInstance(
+        expected: InstanceInfo?,
+        expectedGeneration: Long?,
+        instance: InstanceInfo,
+        generation: Long
+    ): Boolean {
         val options = TransactionOptions().setTransactionType(TransactionOptions.TransactionType.TWO_PHASE)
         return hazelcastInstance.executeTransaction(options) { context ->
             val txInstances = context.getMap<String, InstanceInfo>("instances")
-            txInstances.getForUpdate(instance.id)
+            val current = txInstances.getForUpdate(instance.id)
+            if (current != expected) return@executeTransaction false
+            if (current?.state == InstanceState.STOPPING || current?.state == InstanceState.STOPPED) {
+                return@executeTransaction false
+            }
+            val txGenerations = context.getMap<String, Long>("instanceLifecycleGenerations")
+            val currentGeneration = txGenerations.getForUpdate(instance.id) ?: 0L
+            if (expectedGeneration != null && currentGeneration != expectedGeneration) {
+                return@executeTransaction false
+            }
+            // Generation zero is migrated only through this exact, runtime-confirmed
+            // recovery transaction; legacy tasks themselves remain rejected.
             val txCleanups = context.getMap<String, InstanceInfo>("abandonedStoppingCleanups")
             if (txCleanups.getForUpdate(instance.id) != null) return@executeTransaction false
             val txReservations = context.getMap<String, InstanceResourceReservation>("instanceResourceReservations")
@@ -214,8 +250,10 @@ class ClusterStateService @Inject constructor(
             )
             if (previous != desired) {
                 val txResources = context.getMap<String, NodeResources>("nodeResources")
+                listOfNotNull(previous?.nodeId, desired.nodeId).distinct().sorted()
+                    .forEach { txResources.getForUpdate(it) }
                 if (previous != null) {
-                    val old = txResources.getForUpdate(previous.nodeId) ?: NodeResources()
+                    val old = txResources.get(previous.nodeId) ?: NodeResources()
                     txResources.put(
                         previous.nodeId,
                         NodeResources(
@@ -224,17 +262,108 @@ class ClusterStateService @Inject constructor(
                         )
                     )
                 }
-                val current = txResources.getForUpdate(desired.nodeId) ?: NodeResources()
+                val currentResources = txResources.get(desired.nodeId) ?: NodeResources()
                 txResources.put(
                     desired.nodeId,
-                    NodeResources(current.usedRamMB + desired.ramMB, current.usedCpu + desired.cpu)
+                    NodeResources(
+                        currentResources.usedRamMB + desired.ramMB,
+                        currentResources.usedCpu + desired.cpu
+                    )
                 )
                 txReservations.put(instance.id, desired)
             }
-            context.getMap<String, Long>("instanceLifecycleGenerations").put(instance.id, generation)
+            txGenerations.put(instance.id, generation)
             txInstances.put(instance.id, instance)
             true
         }
+    }
+
+    internal fun claimDeploymentStartup(
+        expected: InstanceInfo,
+        generation: Long,
+        allocatedPort: Int,
+        runtime: String
+    ): InstanceInfo? {
+        val options = TransactionOptions().setTransactionType(TransactionOptions.TransactionType.TWO_PHASE)
+        return hazelcastInstance.executeTransaction(options) { context ->
+            val id = expected.id
+            val txInstances = context.getMap<String, InstanceInfo>("instances")
+            if (txInstances.getForUpdate(id) != expected || expected.state != InstanceState.CREATING) {
+                return@executeTransaction null
+            }
+            val txGenerations = context.getMap<String, Long>("instanceLifecycleGenerations")
+            if ((txGenerations.getForUpdate(id) ?: 0L) != generation) return@executeTransaction null
+            if (!reservationMatches(context, id, generation)) return@executeTransaction null
+            val txDeployments = context.getMap<String, DeploymentCleanupOwnership>(
+                "instanceDeploymentCleanups"
+            )
+            if (txDeployments.getForUpdate(id) != null) return@executeTransaction null
+            val updated = expected.copy(allocatedPort = allocatedPort)
+            txDeployments.put(id, DeploymentCleanupOwnership(generation, allocatedPort, runtime, true))
+            txInstances.put(id, updated)
+            updated
+        }
+    }
+
+    internal fun hasDeploymentCleanup(instanceId: String, generation: Long): Boolean =
+        deploymentCleanups[instanceId]?.generation == generation
+
+    internal fun clearDeploymentCleanup(
+        expected: InstanceInfo,
+        generation: Long
+    ): Boolean {
+        val options = TransactionOptions().setTransactionType(TransactionOptions.TransactionType.TWO_PHASE)
+        return hazelcastInstance.executeTransaction(options) { context ->
+            val id = expected.id
+            if (context.getMap<String, InstanceInfo>("instances").getForUpdate(id) != expected) {
+                return@executeTransaction false
+            }
+            if (
+                (context.getMap<String, Long>("instanceLifecycleGenerations").getForUpdate(id) ?: 0L) != generation
+            ) return@executeTransaction false
+            val cleanups = context.getMap<String, DeploymentCleanupOwnership>("instanceDeploymentCleanups")
+            val cleanup = cleanups.getForUpdate(id) ?: return@executeTransaction true
+            if (cleanup.generation != generation) return@executeTransaction false
+            cleanups.remove(id)
+            true
+        }
+    }
+
+    internal fun cancelCreatingAfterConfirmedTeardown(
+        expected: InstanceInfo,
+        generation: Long
+    ): Boolean {
+        val options = TransactionOptions().setTransactionType(TransactionOptions.TransactionType.TWO_PHASE)
+        return hazelcastInstance.executeTransaction(options) { context ->
+            val id = expected.id
+            val txInstances = context.getMap<String, InstanceInfo>("instances")
+            if (txInstances.getForUpdate(id) != expected || expected.state != InstanceState.CREATING) {
+                return@executeTransaction false
+            }
+            val txGenerations = context.getMap<String, Long>("instanceLifecycleGenerations")
+            if ((txGenerations.getForUpdate(id) ?: 0L) != generation) return@executeTransaction false
+            if (!reservationMatches(context, id, generation)) {
+                return@executeTransaction false
+            }
+            val cleanups = context.getMap<String, DeploymentCleanupOwnership>("instanceDeploymentCleanups")
+            val cleanup = cleanups.getForUpdate(id) ?: return@executeTransaction false
+            if (cleanup.generation != generation) return@executeTransaction false
+            releaseReservation(context, id, generation)
+            cleanups.remove(id)
+            txInstances.remove(id)
+            txGenerations.remove(id)
+            true
+        }
+    }
+
+    internal fun markDeploymentCleanupRequired(
+        expected: InstanceInfo,
+        generation: Long,
+        now: Long = System.currentTimeMillis()
+    ): InstanceInfo? {
+        val stopping = expected.copy(state = InstanceState.STOPPING, lastHeartbeat = now)
+        val nextGeneration = generation + 1
+        return if (transitionLifecycle(expected, generation, stopping, nextGeneration)) stopping else null
     }
 
     internal fun promoteCreatingInstance(
@@ -242,20 +371,28 @@ class ClusterStateService @Inject constructor(
         expectedGeneration: Long,
         onlineInstance: InstanceInfo
     ): Boolean {
-        val map = instances
-        map.lock(expectedInstance.id)
-        return try {
+        val options = TransactionOptions().setTransactionType(TransactionOptions.TransactionType.TWO_PHASE)
+        return hazelcastInstance.executeTransaction(options) { context ->
+            val id = expectedInstance.id
+            val txInstances = context.getMap<String, InstanceInfo>("instances")
             if (
-                map[expectedInstance.id] != expectedInstance ||
-                expectedInstance.state != InstanceState.CREATING ||
-                getLifecycleGeneration(expectedInstance.id) != expectedGeneration ||
-                resourceReservations[expectedInstance.id]?.generation != expectedGeneration
-            ) false else {
-                map[expectedInstance.id] = onlineInstance
-                true
-            }
-        } finally {
-            map.unlock(expectedInstance.id)
+                txInstances.getForUpdate(id) != expectedInstance ||
+                expectedInstance.state != InstanceState.CREATING
+            ) return@executeTransaction false
+            if (
+                (context.getMap<String, Long>("instanceLifecycleGenerations").getForUpdate(id) ?: 0L) !=
+                expectedGeneration
+            ) return@executeTransaction false
+            val reservation = context.getMap<String, InstanceResourceReservation>(
+                "instanceResourceReservations"
+            ).getForUpdate(id)
+            if (reservation?.generation != expectedGeneration) return@executeTransaction false
+            val cleanups = context.getMap<String, DeploymentCleanupOwnership>("instanceDeploymentCleanups")
+            val cleanup = cleanups.getForUpdate(id) ?: return@executeTransaction false
+            if (cleanup.generation != expectedGeneration) return@executeTransaction false
+            cleanups.remove(id)
+            txInstances.put(id, onlineInstance)
+            true
         }
     }
 
@@ -273,6 +410,12 @@ class ClusterStateService @Inject constructor(
                 (txGenerations.getForUpdate(expectedInstance.id) ?: 0L) != expectedGeneration
             ) return@executeTransaction false
             if (!reservationMatches(context, expectedInstance.id, expectedGeneration)) {
+                return@executeTransaction false
+            }
+            val txDeployments = context.getMap<String, DeploymentCleanupOwnership>(
+                "instanceDeploymentCleanups"
+            )
+            if (txDeployments.getForUpdate(expectedInstance.id) != null) {
                 return@executeTransaction false
             }
             releaseReservation(context, expectedInstance.id, expectedGeneration)
@@ -413,12 +556,63 @@ class ClusterStateService @Inject constructor(
             if (!reservationMatches(context, expectedInstance.id, generation)) {
                 return@executeTransaction false
             }
+            val txDeployments = context.getMap<String, DeploymentCleanupOwnership>(
+                "instanceDeploymentCleanups"
+            )
+            val deploymentCleanup = txDeployments.getForUpdate(expectedInstance.id)
+            if (currentInstance.state == InstanceState.CREATING && deploymentCleanup != null) {
+                return@executeTransaction false
+            }
+            txDeployments.remove(expectedInstance.id)
             releaseReservation(context, expectedInstance.id, generation)
             transactionalInstances.put(
                 expectedInstance.id,
                 expectedInstance.copy(state = finalState, lastHeartbeat = completedAt)
             )
             true
+        }
+    }
+
+    internal fun completeInstanceTerminationForRestart(
+        expectedInstance: InstanceInfo,
+        expectedGeneration: Long,
+        nextGeneration: Long,
+        completedAt: Long = System.currentTimeMillis()
+    ): InstanceInfo? {
+        val options = TransactionOptions().setTransactionType(TransactionOptions.TransactionType.TWO_PHASE)
+        return hazelcastInstance.executeTransaction(options) { context ->
+            val id = expectedInstance.id
+            val txInstances = context.getMap<String, InstanceInfo>("instances")
+            if (txInstances.getForUpdate(id) != expectedInstance || expectedInstance.state != InstanceState.STOPPING) {
+                return@executeTransaction null
+            }
+            val txGenerations = context.getMap<String, Long>("instanceLifecycleGenerations")
+            if ((txGenerations.getForUpdate(id) ?: 0L) != expectedGeneration) return@executeTransaction null
+            val txReservations = context.getMap<String, InstanceResourceReservation>("instanceResourceReservations")
+            val reservation = txReservations.getForUpdate(id) ?: return@executeTransaction null
+            if (reservation.generation != expectedGeneration) return@executeTransaction null
+            val stopped = expectedInstance.copy(state = InstanceState.STOPPED, lastHeartbeat = completedAt)
+            txReservations.put(id, reservation.copy(generation = nextGeneration))
+            txGenerations.put(id, nextGeneration)
+            context.getMap<String, DeploymentCleanupOwnership>("instanceDeploymentCleanups").remove(id)
+            txInstances.put(id, stopped)
+            stopped
+        }
+    }
+
+    internal fun releaseTerminalRestartReservation(
+        expected: InstanceInfo,
+        generation: Long
+    ): Boolean {
+        val options = TransactionOptions().setTransactionType(TransactionOptions.TransactionType.TWO_PHASE)
+        return hazelcastInstance.executeTransaction(options) { context ->
+            val txInstances = context.getMap<String, InstanceInfo>("instances")
+            if (txInstances.getForUpdate(expected.id) != expected || expected.state != InstanceState.STOPPED) {
+                return@executeTransaction false
+            }
+            val txGenerations = context.getMap<String, Long>("instanceLifecycleGenerations")
+            if ((txGenerations.getForUpdate(expected.id) ?: 0L) != generation) return@executeTransaction false
+            releaseReservation(context, expected.id, generation)
         }
     }
 
@@ -482,6 +676,11 @@ class ClusterStateService @Inject constructor(
             ) {
                 return@executeTransaction false
             }
+
+            if (
+                context.getMap<String, DeploymentCleanupOwnership>("instanceDeploymentCleanups")
+                    .getForUpdate(instanceId) != null
+            ) return@executeTransaction false
 
             val generation = context.getMap<String, Long>("instanceLifecycleGenerations")
                 .getForUpdate(instanceId) ?: 0L

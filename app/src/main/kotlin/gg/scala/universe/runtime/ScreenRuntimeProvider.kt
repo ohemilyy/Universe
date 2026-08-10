@@ -15,7 +15,14 @@ import java.util.concurrent.ConcurrentHashMap
 @Singleton
 class ScreenRuntimeProvider : RuntimeProvider {
 
+    internal data class CommandResult(val exitCode: Int, val output: String, val error: String)
+
     private val sessions = ConcurrentHashMap<String, ProcessHandle>()
+    private var statusCommand: () -> CommandResult = ::runStatusCommand
+
+    internal fun useStatusCommandForTest(command: () -> CommandResult) {
+        statusCommand = command
+    }
 
     override fun start(
         instanceId: String,
@@ -92,8 +99,8 @@ class ScreenRuntimeProvider : RuntimeProvider {
                 .mapNotNull { line ->
                     Regex("universe-([a-zA-Z0-9]+)").find(line)?.groupValues?.get(1)
                 }
-        } catch (_: Exception) {
-            emptyList()
+        } catch (failure: Exception) {
+            throw IllegalStateException("Failed to discover screen sessions", failure)
         }
     }
 
@@ -125,16 +132,30 @@ class ScreenRuntimeProvider : RuntimeProvider {
     }
 
     private fun hasSession(sessionName: String): Boolean {
+        val result = statusCommand()
+        val output = result.output
+        val error = result.error
+        val exitCode = result.exitCode
+        val diagnostic = "$output\n$error"
+        return when {
+            exitCode == 0 -> output.contains(sessionName)
+            exitCode == 1 && (
+                diagnostic.contains("No Sockets found", ignoreCase = true) ||
+                    diagnostic.contains("No screen session found", ignoreCase = true)
+                ) -> false
+            else -> error(
+                "Unable to confirm screen session '$sessionName' state: ${diagnostic.trim()}"
+            )
+        }
+    }
+
+    private fun runStatusCommand(): CommandResult {
         val process = ProcessBuilder("screen", "-ls")
             .redirectOutput(ProcessBuilder.Redirect.PIPE)
             .redirectError(ProcessBuilder.Redirect.PIPE)
             .start()
         val output = process.inputStream.bufferedReader().readText()
         val error = process.errorStream.bufferedReader().readText()
-        val exitCode = process.waitFor()
-        check(exitCode == 0 || exitCode == 1) {
-            "Unable to confirm screen session '$sessionName' state: ${error.trim()}"
-        }
-        return output.contains(sessionName)
+        return CommandResult(process.waitFor(), output, error)
     }
 }

@@ -95,6 +95,24 @@ class InstanceCountEnforcerTest {
     }
 
     @Test
+    fun `stale creating with a runtime start marker becomes stopping and blocks replacement`() {
+        val creating = instance("old001", InstanceState.CREATING, lastHeartbeat = 0)
+        assertTrue(state.reserveCreatingInstance(creating, 1, Int.MAX_VALUE, Int.MAX_VALUE))
+        val claimed = assertNotNull(
+            state.claimDeploymentStartup(creating, 1, allocatedPort = 25565, runtime = creating.runtime)
+        )
+        val spawner = StateWritingSpawner(state, localMemberId())
+
+        enforcer(spawner).enforceOnce(now = 60_001)
+
+        val retained = assertNotNull(state.getInstance(claimed.id))
+        assertEquals(InstanceState.STOPPING, retained.state)
+        assertEquals(2, state.getLifecycleGeneration(retained.id))
+        assertTrue(state.hasDeploymentCleanup(retained.id, 2))
+        assertNull(state.getInstance("new001"))
+    }
+
+    @Test
     fun `creating that becomes online before reap cancels stale planned spawn`() {
         configuration = configuration.copy(minimumServiceCount = 2)
         state.putConfiguration(configuration)
@@ -360,7 +378,7 @@ class InstanceCountEnforcerTest {
     }
 
     @Test
-    fun `member departure during submission restores stale transition`() {
+    fun `remote submission failure retains stopping for reconciliation`() {
         val wrapperId = localMemberId()
         state.putInstance(
             instance("old001", InstanceState.STOPPING, wrapperId, lastHeartbeat = 0)
@@ -383,7 +401,7 @@ class InstanceCountEnforcerTest {
 
         assertEquals(StopDispatchResult.TARGET_UNAVAILABLE, result)
         assertEquals(InstanceState.STOPPING, state.getInstance("old001")?.state)
-        assertEquals(0, state.getInstance("old001")?.lastHeartbeat)
+        assertEquals(120_001, state.getInstance("old001")?.lastHeartbeat)
     }
 
     @Test
@@ -448,11 +466,12 @@ class InstanceCountEnforcerTest {
 
         enforcer.enforceOnce(now = 120_001)
 
-        assertNull(state.getInstance("old001"))
+        assertEquals(InstanceState.STOPPING, state.getInstance("old001")?.state)
+        assertEquals(120_001, state.getInstance("old001")?.lastHeartbeat)
         assertEquals(InstanceState.ONLINE, state.getInstance("old002")?.state)
         assertEquals(77, state.getInstance("old002")?.lastHeartbeat)
-        assertEquals(configuration.ramMB + 32, state.getNodeResources(wrapperId).usedRamMB)
-        assertEquals(configuration.cpu + 2, state.getNodeResources(wrapperId).usedCpu)
+        assertEquals(configuration.ramMB * 2 + 32, state.getNodeResources(wrapperId).usedRamMB)
+        assertEquals(configuration.cpu * 2 + 2, state.getNodeResources(wrapperId).usedCpu)
         assertNull(state.getInstance("new001"))
     }
 
@@ -590,7 +609,15 @@ class InstanceCountEnforcerTest {
         portAllocator.reserve(singlePort)
         val oldCreating = oldInstance.copy(state = InstanceState.CREATING, processPid = null)
         assertTrue(state.reserveCreatingInstance(oldCreating, 1, 1024, 100))
-        assertTrue(state.promoteCreatingInstance(oldCreating, 1, oldInstance))
+        val startup = assertNotNull(
+            state.claimDeploymentStartup(
+                oldCreating,
+                1,
+                allocatedPort = singlePort,
+                runtime = oldCreating.runtime
+            )
+        )
+        assertTrue(state.promoteCreatingInstance(startup, 1, oldInstance))
 
         assertEquals(
             StopDispatchResult.DISPATCHED,
