@@ -24,7 +24,9 @@ KDoc will explain that setting `hostIP` causes CNI portmap to emit a destination
 
 ## Lifecycle and Reconciliation
 
-The master-side `InstanceState` gains `STOPPING`. Stop dispatch changes state to `STOPPING` before task submission. Callers no longer publish `STOPPED` themselves; only wrapper-side stop completion may do that.
+The master-side `InstanceState` gains `STOPPING`. Stop dispatch changes state to `STOPPING` before task submission. Callers no longer publish `STOPPED` optimistically; normal stop completion publishes it only after wrapper-side cleanup, while the stale-state recovery path may finalize it when the recorded wrapper is no longer a cluster member.
+
+Every transition into `CREATING` or `STOPPING` atomically resets `lastHeartbeat` to the transition time. Stale-state evaluation therefore measures time spent in the current transitional state, not time since the instance's last runtime heartbeat. Restart redeployment likewise writes a fresh `CREATING` timestamp before dispatch.
 
 Minimum-count reconciliation uses one shared lifecycle policy rather than an inline `ONLINE || CREATING` expression. `ONLINE` and `CREATING` count toward the minimum. If any instance of a configuration is `STOPPING`, replacement for that configuration is deferred entirely until the stop completes and its port has been released. This is intentionally a barrier, not merely another state counted toward the minimum.
 
@@ -34,14 +36,17 @@ Port-allocation failure removes the just-created `CREATING` instance record befo
 
 Stop tasks support an explicit restart intent. Wrapper-side restart is serialized as stop, port release, `STOPPED`, then redeploy, so no fixed 500 ms delay races the old allocation. The graceful wait remains bounded; after its existing timeout the runtime is forcibly stopped before the port is released.
 
+Lifecycle endpoints are state-aware during drain. A repeated stop or delete request for an instance already in `STOPPING` returns idempotent `202 Accepted` and does not dispatch another stop task. Start or restart requests against a `STOPPING` instance return `409 Conflict`; callers may retry after the drain completes. This prevents the external `ONLINE` projection from causing duplicate internal lifecycle work.
+
 ## Stale-State Recovery
 
 Reconciliation reaps stale lifecycle records using bounded thresholds:
 
 - A stale `CREATING` record with no successful deployment is removed so minimum-count reconciliation can retry.
-- A stale `STOPPING` record causes a forced stop task to be redispatched to its recorded wrapper. The forced path skips graceful waiting, tears down the runtime, releases the port, and only then writes `STOPPED`.
+- A stale `STOPPING` record first resolves its recorded wrapper against current Hazelcast membership. If the wrapper is online, reconciliation redispatches a forced stop task. The forced path skips graceful waiting, tears down the runtime, releases the port, and only then writes `STOPPED`.
+- If the recorded wrapper is offline or no longer registered, no task is dispatched. Reconciliation releases the instance's master-side resource accounting, marks the record `STOPPED`, and removes the tracking record so minimum-count reconciliation can replace it. The dead wrapper's local port allocation is not authoritative after the member has left the cluster.
 
-The timeout values will be named constants and evaluated from `lastHeartbeat`, allowing deterministic tests without real sleeps. Repeated forced-stop dispatch remains safe because stop and port release operations are idempotent.
+The timeout values will be named constants and evaluated from the transition-reset `lastHeartbeat`, allowing deterministic tests without real sleeps. Repeated forced-stop dispatch remains safe because stop and port release operations are idempotent. Recovery records the forced-stop redispatch time before submission so the enforcer does not submit the same recovery task every five seconds while it is still in flight.
 
 ## Compatibility
 
@@ -71,6 +76,9 @@ Regression coverage will include:
 - A single-port stop/drain/respawn cycle does not deploy while stopping and converges after release.
 - Port release precedes the `STOPPED` state transition and restart deployment.
 - Stale `CREATING` is reaped and stale `STOPPING` triggers forced teardown.
+- A stale `STOPPING` instance whose wrapper is absent is finalized and reaped locally without dispatch.
+- Entering `CREATING` or `STOPPING` resets the timestamp used by stale-state evaluation.
+- Repeated stop during `STOPPING` is accepted without redispatch, while conflicting start/restart requests return conflict.
 - REST responses never expose `STOPPING`, and plugin-side unknown-state parsing remains tolerant.
 
 Tests will use deterministic lifecycle functions and fakes at external boundaries; they will not depend on a live Kubernetes or Hazelcast cluster.
