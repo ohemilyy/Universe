@@ -73,6 +73,7 @@ class InstanceCountEnforcer @Inject constructor(
     internal fun enforceOnce(now: Long = System.currentTimeMillis()) {
         if (!configuration.isMasterNode || shuttingDown) return
 
+        clusterStateService.completePendingAbandonedStoppingCleanups()
         val liveMembers = hazelcastInstance.cluster.members.associateBy { it.uuid.toString() }
         val liveWrapperIds = liveMembers.keys
         val allInstances = clusterStateService.getAllInstances()
@@ -109,7 +110,10 @@ class InstanceCountEnforcer @Inject constructor(
                     expectedLastHeartbeat = plannedInstance.lastHeartbeat,
                     transitionAt = now
                 )
-                if (result == StopDispatchResult.TARGET_UNAVAILABLE) {
+                if (
+                    result == StopDispatchResult.TARGET_UNAVAILABLE ||
+                    result == StopDispatchResult.SUBMISSION_FAILED
+                ) {
                     val currentLiveWrapperIds = hazelcastInstance.cluster.members
                         .mapTo(mutableSetOf()) { it.uuid.toString() }
                     finalizeAbandonedStopping(

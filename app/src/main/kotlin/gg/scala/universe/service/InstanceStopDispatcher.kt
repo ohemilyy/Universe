@@ -7,6 +7,7 @@ enum class StopDispatchResult {
     ALREADY_STOPPING,
     STALE_TRANSITION,
     TARGET_UNAVAILABLE,
+    SUBMISSION_FAILED,
     NOT_FOUND
 }
 
@@ -24,6 +25,7 @@ internal fun StopDispatchResult.toRequestOutcome(restart: Boolean): StopDispatch
     }
     StopDispatchResult.STALE_TRANSITION -> StopDispatchOutcome.CONFLICT
     StopDispatchResult.TARGET_UNAVAILABLE -> StopDispatchOutcome.NOT_FOUND
+    StopDispatchResult.SUBMISSION_FAILED -> StopDispatchOutcome.CONFLICT
     StopDispatchResult.NOT_FOUND -> StopDispatchOutcome.NOT_FOUND
 }
 

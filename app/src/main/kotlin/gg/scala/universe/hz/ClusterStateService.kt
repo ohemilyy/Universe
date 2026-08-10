@@ -22,6 +22,9 @@ class ClusterStateService @Inject constructor(
     val nodeResources: IMap<String, NodeResources>
         get() = hazelcastInstance.getMap("nodeResources")
 
+    private val abandonedStoppingCleanups: IMap<String, InstanceInfo>
+        get() = hazelcastInstance.getMap("abandonedStoppingCleanups")
+
     fun getConfiguration(name: String): Configuration? {
         return configurations[name]
     }
@@ -85,7 +88,10 @@ class ClusterStateService @Inject constructor(
         instances.lock(id)
         return try {
             val existing = instances[id] ?: return null
-            if (existing.state == InstanceState.STOPPING) {
+            if (
+                existing.state == InstanceState.STOPPING ||
+                abandonedStoppingCleanups.containsKey(id)
+            ) {
                 existing
             } else {
                 existing.copy(state = state, lastHeartbeat = lastHeartbeat).also {
@@ -102,21 +108,35 @@ class ClusterStateService @Inject constructor(
         expectedLastHeartbeat: Long,
         stoppedAt: Long
     ): Boolean {
+        if (!claimAbandonedStopping(instanceId, expectedLastHeartbeat, stoppedAt)) {
+            return false
+        }
+        return completeAbandonedStoppingCleanup(instanceId)
+    }
+
+    internal fun claimAbandonedStopping(
+        instanceId: String,
+        expectedLastHeartbeat: Long,
+        stoppedAt: Long
+    ): Boolean {
         val transactionOptions = TransactionOptions().setTransactionType(
             TransactionOptions.TransactionType.TWO_PHASE
         )
-        val stoppedInstance = hazelcastInstance.executeTransaction(transactionOptions) { context ->
+        return hazelcastInstance.executeTransaction(transactionOptions) { context ->
             val transactionalInstances = context.getMap<String, InstanceInfo>("instances")
             val instance = transactionalInstances.getForUpdate(instanceId)
-                ?: return@executeTransaction null
-            if (instance.state == InstanceState.STOPPED && instance.lastHeartbeat == stoppedAt) {
-                return@executeTransaction instance
+            val transactionalCleanups = context.getMap<String, InstanceInfo>(
+                "abandonedStoppingCleanups"
+            )
+            if (transactionalCleanups.getForUpdate(instanceId) != null) {
+                return@executeTransaction true
             }
+            instance ?: return@executeTransaction false
             if (
                 instance.state != InstanceState.STOPPING ||
                 instance.lastHeartbeat != expectedLastHeartbeat
             ) {
-                return@executeTransaction null
+                return@executeTransaction false
             }
 
             val transactionalResources = context.getMap<String, NodeResources>("nodeResources")
@@ -129,13 +149,48 @@ class ClusterStateService @Inject constructor(
                     usedCpu = maxOf(0, resources.usedCpu - instance.allocatedCpu)
                 )
             )
-            instance.copy(state = InstanceState.STOPPED, lastHeartbeat = stoppedAt).also {
-                transactionalInstances.put(instanceId, it)
+            val stoppedInstance = instance.copy(
+                state = InstanceState.STOPPED,
+                lastHeartbeat = stoppedAt
+            )
+            transactionalInstances.put(instanceId, stoppedInstance)
+            transactionalCleanups.put(instanceId, stoppedInstance)
+            true
+        }
+    }
+
+    internal fun completePendingAbandonedStoppingCleanups(): Int {
+        return abandonedStoppingCleanups.keys.count { instanceId ->
+            completeAbandonedStoppingCleanup(instanceId)
+        }
+    }
+
+    private fun completeAbandonedStoppingCleanup(instanceId: String): Boolean {
+        val transactionOptions = TransactionOptions().setTransactionType(
+            TransactionOptions.TransactionType.TWO_PHASE
+        )
+        return hazelcastInstance.executeTransaction(transactionOptions) { context ->
+            val transactionalInstances = context.getMap<String, InstanceInfo>("instances")
+            val currentInstance = transactionalInstances.getForUpdate(instanceId)
+            val transactionalCleanups = context.getMap<String, InstanceInfo>(
+                "abandonedStoppingCleanups"
+            )
+            val claimedInstance = transactionalCleanups.getForUpdate(instanceId)
+                ?: return@executeTransaction false
+
+            when {
+                currentInstance == null -> {
+                    transactionalCleanups.remove(instanceId)
+                    true
+                }
+                currentInstance == claimedInstance -> {
+                    transactionalInstances.remove(instanceId)
+                    transactionalCleanups.remove(instanceId)
+                    true
+                }
+                else -> false
             }
         }
-        stoppedInstance ?: return false
-        instances.remove(instanceId, stoppedInstance)
-        return true
     }
 
     fun getNodeResources(nodeId: String): NodeResources {

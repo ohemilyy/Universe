@@ -21,6 +21,8 @@ import gg.scala.universe.extension.ExtensionService
 import gg.scala.universe.metrics.MetricsRegistry
 import gg.scala.universe.metrics.MetricsRegistryImpl
 import gg.scala.universe.hz.task.TaskDispatcher
+import gg.scala.universe.hz.task.HazelcastStopTaskSubmissionGateway
+import gg.scala.universe.hz.task.StopTaskSubmissionGateway
 import gg.scala.universe.runtime.RuntimeRegistry
 import gg.scala.universe.runtime.RuntimeRegistryImpl
 import gg.scala.universe.template.DefaultTemplateVariableProvider
@@ -41,6 +43,7 @@ class MainGuiceModule : AbstractModule() {
     override fun configure() {
         bind(RuntimeRegistry::class.java).to(RuntimeRegistryImpl::class.java).asEagerSingleton()
         bind(TaskDispatcher::class.java).asEagerSingleton()
+        bind(StopTaskSubmissionGateway::class.java).to(HazelcastStopTaskSubmissionGateway::class.java)
         bind(InstanceStopDispatcher::class.java).to(TaskDispatcher::class.java)
         bind(InstanceSpawner::class.java).to(InstanceCreationService::class.java)
         bind(CommandProvider::class.java).to(CommandProviderImpl::class.java).asEagerSingleton()

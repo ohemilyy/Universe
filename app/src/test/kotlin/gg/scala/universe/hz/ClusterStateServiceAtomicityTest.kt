@@ -123,6 +123,48 @@ class ClusterStateServiceAtomicityTest {
         assertEquals(2, state.getNodeResources("node-1").usedCpu)
     }
 
+    @Test
+    fun `claimed abandoned cleanup survives interruption and rejects late revival`() {
+        val instanceId = "old001"
+        state.addNodeResources("node-1", ramMB = 96, cpu = 3)
+        state.putInstance(instance(instanceId, InstanceState.STOPPING, lastHeartbeat = 0))
+
+        assertTrue(
+            state.claimAbandonedStopping(
+                instanceId = instanceId,
+                expectedLastHeartbeat = 0,
+                stoppedAt = 120_001
+            )
+        )
+        assertEquals(InstanceState.STOPPED, state.getInstance(instanceId)?.state)
+        assertEquals(32, state.getNodeResources("node-1").usedRamMB)
+        assertEquals(2, state.getNodeResources("node-1").usedCpu)
+
+        val lateReport = state.updateInstanceFromPlugin(
+            instanceId,
+            InstanceState.ONLINE,
+            lastHeartbeat = 120_002
+        )
+        assertEquals(InstanceState.STOPPED, lateReport?.state)
+        assertEquals(InstanceState.STOPPED, state.getInstance(instanceId)?.state)
+
+        assertTrue(
+            state.claimAbandonedStopping(
+                instanceId = instanceId,
+                expectedLastHeartbeat = 0,
+                stoppedAt = 120_003
+            )
+        )
+        assertEquals(32, state.getNodeResources("node-1").usedRamMB)
+        assertEquals(2, state.getNodeResources("node-1").usedCpu)
+
+        assertEquals(1, state.completePendingAbandonedStoppingCleanups())
+        assertEquals(0, state.completePendingAbandonedStoppingCleanups())
+        assertNull(state.getInstance(instanceId))
+        assertEquals(32, state.getNodeResources("node-1").usedRamMB)
+        assertEquals(2, state.getNodeResources("node-1").usedCpu)
+    }
+
     private fun instance(id: String, state: InstanceState, lastHeartbeat: Long) = InstanceInfo(
         id = id,
         configurationName = "site",

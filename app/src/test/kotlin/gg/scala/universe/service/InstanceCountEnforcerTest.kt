@@ -2,6 +2,7 @@ package gg.scala.universe.service
 
 import com.hazelcast.cluster.Member
 import com.hazelcast.config.Config
+import com.hazelcast.core.MemberLeftException
 import com.hazelcast.core.EntryEvent
 import com.hazelcast.core.Hazelcast
 import com.hazelcast.core.HazelcastInstance
@@ -11,6 +12,7 @@ import gg.scala.universe.config.UniverseMainConfiguration
 import gg.scala.universe.hz.ClusterStateService
 import gg.scala.universe.hz.task.TaskDispatcher
 import gg.scala.universe.hz.task.TaskRouter
+import gg.scala.universe.hz.task.StopTaskSubmissionGateway
 import gg.scala.universe.runtime.PortAllocator
 import gg.scala.universe.runtime.RuntimeProvider
 import gg.scala.universe.runtime.RuntimeRegistryImpl
@@ -139,6 +141,29 @@ class InstanceCountEnforcerTest {
         assertEquals(0, state.getNodeResources("departed").usedCpu)
         assertEquals(InstanceState.ONLINE, state.getInstance("new001")?.state)
         assertTrue(stopDispatcher.invocations.isEmpty())
+    }
+
+    @Test
+    fun `pending abandoned cleanup is reaped before replacement planning`() {
+        state.addNodeResources("departed", configuration.ramMB + 32, configuration.cpu + 2)
+        state.putInstance(
+            instance("old001", InstanceState.STOPPING, "departed", lastHeartbeat = 0)
+        )
+        assertTrue(
+            state.claimAbandonedStopping(
+                instanceId = "old001",
+                expectedLastHeartbeat = 0,
+                stoppedAt = 120_001
+            )
+        )
+        val enforcer = enforcer(StateWritingSpawner(state, localMemberId()))
+
+        enforcer.enforceOnce(now = 120_002)
+
+        assertNull(state.getInstance("old001"))
+        assertEquals(32, state.getNodeResources("departed").usedRamMB)
+        assertEquals(2, state.getNodeResources("departed").usedCpu)
+        assertEquals(InstanceState.ONLINE, state.getInstance("new001")?.state)
     }
 
     @Test
@@ -299,6 +324,91 @@ class InstanceCountEnforcerTest {
 
         assertEquals(StopDispatchResult.TARGET_UNAVAILABLE, result)
         assertEquals(0, state.getInstance("old001")?.lastHeartbeat)
+    }
+
+    @Test
+    fun `member departure during submission restores stale transition`() {
+        val wrapperId = localMemberId()
+        state.putInstance(
+            instance("old001", InstanceState.STOPPING, wrapperId, lastHeartbeat = 0)
+        )
+        val dispatcher = TaskDispatcher(
+            hazelcastInstance,
+            state,
+            StopTaskSubmissionGateway { _, _ ->
+                CompletableFuture.failedFuture(MemberLeftException("member left"))
+            }
+        )
+
+        val result = dispatcher.dispatchStop(
+            instanceId = "old001",
+            targetMember = hazelcastInstance.cluster.localMember,
+            force = true,
+            expectedLastHeartbeat = 0,
+            transitionAt = 120_001
+        )
+
+        assertEquals(StopDispatchResult.TARGET_UNAVAILABLE, result)
+        assertEquals(InstanceState.STOPPING, state.getInstance("old001")?.state)
+        assertEquals(0, state.getInstance("old001")?.lastHeartbeat)
+    }
+
+    @Test
+    fun `submission failure cannot roll a newer online transition back to stopping`() {
+        val wrapperId = localMemberId()
+        state.putInstance(
+            instance("old001", InstanceState.STOPPING, wrapperId, lastHeartbeat = 0)
+        )
+        val dispatcher = TaskDispatcher(
+            hazelcastInstance,
+            state,
+            StopTaskSubmissionGateway { _, _ ->
+                val current = assertNotNull(state.getInstance("old001"))
+                state.putInstance(current.copy(state = InstanceState.ONLINE, lastHeartbeat = 77))
+                CompletableFuture.failedFuture(MemberLeftException("member left"))
+            }
+        )
+
+        val result = dispatcher.dispatchStop(
+            instanceId = "old001",
+            targetMember = hazelcastInstance.cluster.localMember,
+            force = true,
+            expectedLastHeartbeat = 0,
+            transitionAt = 120_001
+        )
+
+        assertEquals(StopDispatchResult.TARGET_UNAVAILABLE, result)
+        assertEquals(InstanceState.ONLINE, state.getInstance("old001")?.state)
+        assertEquals(77, state.getInstance("old001")?.lastHeartbeat)
+    }
+
+    @Test
+    fun `accepted stop submission wait is bounded`() {
+        val wrapperId = localMemberId()
+        state.putInstance(
+            instance("old001", InstanceState.STOPPING, wrapperId, lastHeartbeat = 0)
+        )
+        val pending = CompletableFuture<String>()
+        val dispatcher = TaskDispatcher(
+            hazelcastInstance,
+            state,
+            StopTaskSubmissionGateway { _, _ -> pending }
+        )
+
+        val startedAt = System.nanoTime()
+        val result = dispatcher.dispatchStop(
+            instanceId = "old001",
+            targetMember = hazelcastInstance.cluster.localMember,
+            force = true,
+            expectedLastHeartbeat = 0,
+            transitionAt = 120_001
+        )
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+        pending.cancel(true)
+
+        assertEquals(StopDispatchResult.DISPATCHED, result)
+        assertTrue(elapsedMs < 2_000, "dispatch waited ${elapsedMs}ms")
+        assertEquals(120_001, state.getInstance("old001")?.lastHeartbeat)
     }
 
     @Test
