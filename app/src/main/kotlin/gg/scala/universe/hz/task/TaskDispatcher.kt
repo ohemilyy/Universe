@@ -80,6 +80,9 @@ class TaskDispatcher @Inject constructor(
         try {
             val instance = instances[instanceId]
                 ?: return StopDispatchResult.NOT_FOUND
+            if (clusterStateService.isAbandonedStoppingCleanupClaimed(instanceId)) {
+                return StopDispatchResult.NOT_FOUND
+            }
             if (
                 expectedLastHeartbeat != null &&
                 (instance.state != InstanceState.STOPPING ||

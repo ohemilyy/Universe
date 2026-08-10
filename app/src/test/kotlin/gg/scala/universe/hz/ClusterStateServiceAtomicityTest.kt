@@ -165,6 +165,69 @@ class ClusterStateServiceAtomicityTest {
         assertEquals(2, state.getNodeResources("node-1").usedCpu)
     }
 
+    @Test
+    fun `cleanup claims reject generic master and wrapper state publication`() {
+        state.addNodeResources("node-1", ramMB = 160, cpu = 4)
+        val first = instance("old001", InstanceState.STOPPING, lastHeartbeat = 0)
+        val second = instance("old002", InstanceState.STOPPING, lastHeartbeat = 0)
+        state.putInstance(first)
+        state.putInstance(second)
+        assertTrue(state.claimAbandonedStopping("old001", 0, 120_001))
+        assertTrue(state.claimAbandonedStopping("old002", 0, 120_001))
+
+        state.updateInstanceState("old001", InstanceState.ONLINE, lastHeartbeat = 120_002)
+        state.putInstance(
+            second.copy(state = InstanceState.ONLINE, lastHeartbeat = 120_002)
+        )
+
+        assertEquals(InstanceState.STOPPED, state.getInstance("old001")?.state)
+        assertEquals(120_001, state.getInstance("old001")?.lastHeartbeat)
+        assertEquals(InstanceState.STOPPED, state.getInstance("old002")?.state)
+        assertEquals(120_001, state.getInstance("old002")?.lastHeartbeat)
+        assertEquals(32, state.getNodeResources("node-1").usedRamMB)
+        assertEquals(2, state.getNodeResources("node-1").usedCpu)
+        assertEquals(2, state.completePendingAbandonedStoppingCleanups())
+        assertNull(state.getInstance("old001"))
+        assertNull(state.getInstance("old002"))
+    }
+
+    @Test
+    fun `terminal completion rejects already terminal snapshots without resource changes`() {
+        state.addNodeResources("node-1", ramMB = 96, cpu = 3)
+        val online = instance("old001", InstanceState.ONLINE, lastHeartbeat = 1)
+        state.putInstance(online)
+
+        assertTrue(
+            state.completeInstanceTermination(
+                expectedInstance = online,
+                finalState = InstanceState.STOPPED,
+                completedAt = 2
+            )
+        )
+        val stopped = state.getInstance("old001")!!
+        assertFalse(
+            state.completeInstanceTermination(
+                expectedInstance = stopped,
+                finalState = InstanceState.STOPPED,
+                completedAt = 3
+            )
+        )
+        val offline = instance("old002", InstanceState.OFFLINE, lastHeartbeat = 1)
+        state.putInstance(offline)
+        assertFalse(
+            state.completeInstanceTermination(
+                expectedInstance = offline,
+                finalState = InstanceState.STOPPED,
+                completedAt = 3
+            )
+        )
+
+        assertEquals(32, state.getNodeResources("node-1").usedRamMB)
+        assertEquals(2, state.getNodeResources("node-1").usedCpu)
+        assertEquals(2, state.getInstance("old001")?.lastHeartbeat)
+        assertEquals(InstanceState.OFFLINE, state.getInstance("old002")?.state)
+    }
+
     private fun instance(id: String, state: InstanceState, lastHeartbeat: Long) = InstanceInfo(
         id = id,
         configurationName = "site",

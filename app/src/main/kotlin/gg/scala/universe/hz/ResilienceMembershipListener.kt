@@ -24,12 +24,27 @@ class ResilienceMembershipListener(
             return
         }
 
+        var offlineCount = 0
         affectedInstances.forEach { instance ->
-            log("Marking instance ${instance.id} as OFFLINE (was on wrapper $memberUuid)", LogLevel.WARNING)
-            clusterStateService.updateInstanceState(instance.id, InstanceState.OFFLINE)
+            val updated = clusterStateService.markInstanceOfflineAfterWrapperDeparture(
+                id = instance.id,
+                wrapperNodeId = memberUuid
+            ) ?: return@forEach
+            if (updated.state == InstanceState.STOPPING) {
+                log(
+                    "Preserving STOPPING instance ${instance.id} for reconciliation",
+                    LogLevel.WARNING
+                )
+            } else if (updated.state == InstanceState.OFFLINE) {
+                offlineCount++
+                log(
+                    "Marked instance ${instance.id} as OFFLINE (was on wrapper $memberUuid)",
+                    LogLevel.WARNING
+                )
+            }
         }
 
-        log("Marked ${affectedInstances.size} instance(s) as OFFLINE", LogLevel.WARNING)
+        log("Marked $offlineCount instance(s) as OFFLINE", LogLevel.WARNING)
 
         // Clear node resource tracking for the disconnected wrapper
         clusterStateService.clearNodeResources(memberUuid)

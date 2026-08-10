@@ -83,13 +83,6 @@ class NodeShutdownService @Inject constructor(
                 // Release port
                 portAllocator.release(instance.allocatedPort)
 
-                // Release node resources
-                try {
-                    clusterStateService.removeNodeResources(localNodeId, instance.allocatedRamMB, instance.allocatedCpu)
-                } catch (_: com.hazelcast.core.HazelcastInstanceNotActiveException) {
-                    // Hazelcast down — resources will be cleaned up on next startup
-                }
-
                 // Clean up working directory for non-static instances
                 if (config?.static != true) {
                     val workingDir = Paths.get("./running/${instance.id}").toAbsolutePath().normalize()
@@ -105,9 +98,11 @@ class NodeShutdownService @Inject constructor(
                     }
                 }
 
-                // Mark as STOPPED
                 try {
-                    clusterStateService.updateInstanceState(instance.id, InstanceState.STOPPED)
+                    clusterStateService.completeInstanceTermination(
+                        expectedInstance = instance,
+                        finalState = InstanceState.STOPPED
+                    )
                 } catch (_: com.hazelcast.core.HazelcastInstanceNotActiveException) {
                     // Hazelcast down — state will be reconciled on next startup
                 }

@@ -91,9 +91,6 @@ class InstanceHealthMonitor @Inject constructor(
         // Release port
         portAllocator.release(instance.allocatedPort)
 
-        // Release node resources
-        clusterStateService.removeNodeResources(instance.wrapperNodeId, instance.allocatedRamMB, instance.allocatedCpu)
-
         // Clean up working directory for non-static instances
         if (config?.static != true) {
             val workingDir = Paths.get("./running/${instance.id}").toAbsolutePath().normalize()
@@ -109,12 +106,14 @@ class InstanceHealthMonitor @Inject constructor(
             }
         }
 
-        // Mark OFFLINE with updated heartbeat so we know when it went offline
-        val updated = instance.copy(
-            state = InstanceState.OFFLINE,
-            lastHeartbeat = System.currentTimeMillis()
+        val completed = clusterStateService.completeInstanceTermination(
+            expectedInstance = instance,
+            finalState = InstanceState.OFFLINE
         )
-        clusterStateService.putInstance(updated)
-        log("Instance ${instance.id} marked OFFLINE and resources released", LogLevel.INFO)
+        if (completed) {
+            log("Instance ${instance.id} marked OFFLINE and resources released", LogLevel.INFO)
+        } else {
+            log("Instance ${instance.id} termination was superseded", LogLevel.INFO)
+        }
     }
 }

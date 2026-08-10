@@ -60,7 +60,10 @@ class InstanceCreationService @Inject constructor(
             runtime = configuration.runtime
         )
 
-        clusterStateService.putInstance(instanceInfo)
+        if (!clusterStateService.putInstance(instanceInfo)) {
+            log("Instance '$id' is already owned by reconciliation cleanup", LogLevel.WARNING)
+            return null
+        }
         taskDispatcher.dispatchDeploy(instanceInfo, wrapperMember)
 
         return instanceInfo

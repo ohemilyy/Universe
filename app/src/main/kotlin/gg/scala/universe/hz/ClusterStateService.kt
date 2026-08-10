@@ -56,16 +56,33 @@ class ClusterStateService @Inject constructor(
         }
     }
 
-    fun putInstance(info: InstanceInfo) {
-        instances[info.id] = info
+    fun putInstance(info: InstanceInfo): Boolean {
+        instances.lock(info.id)
+        return try {
+            if (abandonedStoppingCleanups.containsKey(info.id)) return false
+            instances[info.id] = info
+            true
+        } finally {
+            instances.unlock(info.id)
+        }
     }
 
-    fun removeInstance(id: String) {
-        instances.remove(id)
+    fun removeInstance(id: String): Boolean {
+        instances.lock(id)
+        return try {
+            if (abandonedStoppingCleanups.containsKey(id)) return false
+            instances.remove(id) != null
+        } finally {
+            instances.unlock(id)
+        }
     }
 
     fun getInstancesByWrapper(nodeId: String): List<InstanceInfo> {
         return instances.values.filter { it.wrapperNodeId == nodeId }
+    }
+
+    internal fun isAbandonedStoppingCleanupClaimed(id: String): Boolean {
+        return abandonedStoppingCleanups.containsKey(id)
     }
 
     fun updateInstanceState(
@@ -73,11 +90,17 @@ class ClusterStateService @Inject constructor(
         state: InstanceState,
         lastHeartbeat: Long = System.currentTimeMillis()
     ) {
-        val existing = instances[id] ?: return
-        instances[id] = existing.copy(
-            state = state,
-            lastHeartbeat = lastHeartbeat
-        )
+        instances.lock(id)
+        try {
+            val existing = instances[id] ?: return
+            if (abandonedStoppingCleanups.containsKey(id)) return
+            instances[id] = existing.copy(
+                state = state,
+                lastHeartbeat = lastHeartbeat
+            )
+        } finally {
+            instances.unlock(id)
+        }
     }
 
     fun updateInstanceFromPlugin(
@@ -97,6 +120,81 @@ class ClusterStateService @Inject constructor(
                 existing.copy(state = state, lastHeartbeat = lastHeartbeat).also {
                     instances[id] = it
                 }
+            }
+        } finally {
+            instances.unlock(id)
+        }
+    }
+
+    internal fun completeInstanceTermination(
+        expectedInstance: InstanceInfo,
+        finalState: InstanceState,
+        completedAt: Long = System.currentTimeMillis()
+    ): Boolean {
+        require(finalState == InstanceState.STOPPED || finalState == InstanceState.OFFLINE) {
+            "Terminal completion requires STOPPED or OFFLINE, got $finalState"
+        }
+        val transactionOptions = TransactionOptions().setTransactionType(
+            TransactionOptions.TransactionType.TWO_PHASE
+        )
+        return hazelcastInstance.executeTransaction(transactionOptions) { context ->
+            val transactionalInstances = context.getMap<String, InstanceInfo>("instances")
+            val currentInstance = transactionalInstances.getForUpdate(expectedInstance.id)
+                ?: return@executeTransaction false
+            val transactionalCleanups = context.getMap<String, InstanceInfo>(
+                "abandonedStoppingCleanups"
+            )
+            if (transactionalCleanups.getForUpdate(expectedInstance.id) != null) {
+                return@executeTransaction false
+            }
+            if (
+                currentInstance != expectedInstance ||
+                currentInstance.state !in setOf(
+                    InstanceState.CREATING,
+                    InstanceState.ONLINE,
+                    InstanceState.STOPPING
+                )
+            ) {
+                return@executeTransaction false
+            }
+
+            val transactionalResources = context.getMap<String, NodeResources>("nodeResources")
+            val resources = transactionalResources.getForUpdate(expectedInstance.wrapperNodeId)
+                ?: NodeResources()
+            transactionalResources.put(
+                expectedInstance.wrapperNodeId,
+                NodeResources(
+                    usedRamMB = maxOf(0, resources.usedRamMB - expectedInstance.allocatedRamMB),
+                    usedCpu = maxOf(0, resources.usedCpu - expectedInstance.allocatedCpu)
+                )
+            )
+            transactionalInstances.put(
+                expectedInstance.id,
+                expectedInstance.copy(state = finalState, lastHeartbeat = completedAt)
+            )
+            true
+        }
+    }
+
+    fun markInstanceOfflineAfterWrapperDeparture(
+        id: String,
+        wrapperNodeId: String,
+        lastHeartbeat: Long = System.currentTimeMillis()
+    ): InstanceInfo? {
+        instances.lock(id)
+        return try {
+            val existing = instances[id] ?: return null
+            if (
+                existing.wrapperNodeId != wrapperNodeId ||
+                existing.state == InstanceState.STOPPING ||
+                abandonedStoppingCleanups.containsKey(id)
+            ) {
+                existing
+            } else {
+                existing.copy(
+                    state = InstanceState.OFFLINE,
+                    lastHeartbeat = lastHeartbeat
+                ).also { instances[id] = it }
             }
         } finally {
             instances.unlock(id)

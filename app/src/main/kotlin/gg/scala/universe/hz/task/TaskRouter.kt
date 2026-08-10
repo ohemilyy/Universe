@@ -125,7 +125,9 @@ class TaskRouter @Inject constructor(
                 hostAddress = finalHostAddress,
                 runtime = configuration.runtime
             )
-            clusterStateService.putInstance(online)
+            if (!clusterStateService.putInstance(online)) {
+                error("Instance ${task.instanceId} is owned by reconciliation cleanup")
+            }
 
             resourceNodeId = online.wrapperNodeId
             clusterStateService.addNodeResources(resourceNodeId, configuration.ramMB, configuration.cpu)
@@ -195,8 +197,17 @@ class TaskRouter @Inject constructor(
 
         runtimeProvider.stop(task.instanceId)
         portAllocator.release(instance.allocatedPort)
-        cleanupWorkingDirectoryAndResources(instance, configuration)
-        clusterStateService.updateInstanceState(task.instanceId, InstanceState.STOPPED)
+        cleanupWorkingDirectory(instance, configuration)
+        val completed = clusterStateService.completeInstanceTermination(
+            expectedInstance = instance,
+            finalState = InstanceState.STOPPED
+        )
+        if (!completed) {
+            return log(
+                "Stop completion for instance ${task.instanceId} was superseded by reconciliation",
+                LogLevel.WARNING
+            )
+        }
         log("Instance ${task.instanceId} stopped")
 
         if (task.restart) {
@@ -211,7 +222,7 @@ class TaskRouter @Inject constructor(
         }
     }
 
-    private fun cleanupWorkingDirectoryAndResources(
+    private fun cleanupWorkingDirectory(
         instance: InstanceInfo,
         configuration: Configuration?
     ) {
@@ -219,8 +230,6 @@ class TaskRouter @Inject constructor(
             val workingDir = Paths.get("./running/${instance.id}").toAbsolutePath().normalize()
             cleanupWorkingDirectory(instance.id, workingDir)
         }
-
-        clusterStateService.removeNodeResources(instance.wrapperNodeId, instance.allocatedRamMB, instance.allocatedCpu)
     }
 
     private fun cleanupWorkingDirectory(instanceId: String, workingDir: Path) {
@@ -271,7 +280,10 @@ class TaskRouter @Inject constructor(
                     ?: runtimeRegistry.getAll().values.firstOrNull()
                 runtimeProvider?.stop(instance.id)
                 portAllocator.release(instance.allocatedPort)
-                clusterStateService.updateInstanceState(instance.id, InstanceState.STOPPED)
+                clusterStateService.completeInstanceTermination(
+                    expectedInstance = instance,
+                    finalState = InstanceState.STOPPED
+                )
                 log("Stopped instance ${instance.id} during shutdown")
             } catch (e: Exception) {
                 log("Failed to stop instance ${instance.id} during shutdown: ${e.message}", LogLevel.WARNING)

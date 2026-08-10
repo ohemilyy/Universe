@@ -184,6 +184,51 @@ class TaskRouterLifecycleTest {
         assertEquals(listOf("stop:old001"), runtime.operations)
     }
 
+    @Test
+    fun `claimed abandoned cleanup owns delayed stop completion and blocks restart`() {
+        val instance = onlineInstance("old001").copy(
+            state = InstanceState.STOPPING,
+            lastHeartbeat = 0
+        )
+        portAllocator.reserve(singlePort)
+        state.addNodeResources(instance.wrapperNodeId, ramMB = 96, cpu = 3)
+        state.putInstance(instance)
+        val stopStarted = CountDownLatch(1)
+        val allowStopCompletion = CountDownLatch(1)
+        runtime.stopBlocker = {
+            stopStarted.countDown()
+            allowStopCompletion.await(2, TimeUnit.SECONDS)
+        }
+        val routing = CompletableFuture.runAsync {
+            router.route(StopInstanceTask("old001", force = true, restart = true))
+        }
+        assertTrue(stopStarted.await(2, TimeUnit.SECONDS))
+        try {
+            assertTrue(
+                state.claimAbandonedStopping(
+                    instanceId = "old001",
+                    expectedLastHeartbeat = 0,
+                    stoppedAt = 120_001
+                )
+            )
+        } finally {
+            allowStopCompletion.countDown()
+        }
+
+        routing.get(2, TimeUnit.SECONDS)
+
+        assertEquals(32, state.getNodeResources(instance.wrapperNodeId).usedRamMB)
+        assertEquals(2, state.getNodeResources(instance.wrapperNodeId).usedCpu)
+        assertEquals(InstanceState.STOPPED, state.getInstance("old001")?.state)
+        assertEquals(120_001, state.getInstance("old001")?.lastHeartbeat)
+        assertEquals(listOf("stop:old001"), runtime.operations)
+        assertTrue(singlePort !in portAllocator.getLocalAllocations())
+        assertEquals(1, state.completePendingAbandonedStoppingCleanups())
+        assertNull(state.getInstance("old001"))
+        assertEquals(32, state.getNodeResources(instance.wrapperNodeId).usedRamMB)
+        assertEquals(2, state.getNodeResources(instance.wrapperNodeId).usedCpu)
+    }
+
     private fun creatingInstance(id: String, allocatedPort: Int) = InstanceInfo(
         id = id,
         configurationName = configuration.name,
@@ -214,6 +259,7 @@ class TaskRouterLifecycleTest {
         val operations = mutableListOf<String>()
         var isRunningChecks = 0
         var failHostLookup = false
+        var stopBlocker: (() -> Unit)? = null
 
         override fun start(
             instanceId: String,
@@ -231,6 +277,7 @@ class TaskRouterLifecycleTest {
 
         override fun stop(instanceId: String) {
             operations += "stop:$instanceId"
+            stopBlocker?.invoke()
         }
 
         override fun executeCommand(instanceId: String, command: String) = Unit

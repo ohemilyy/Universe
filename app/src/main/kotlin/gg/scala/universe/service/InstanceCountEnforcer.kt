@@ -110,10 +110,15 @@ class InstanceCountEnforcer @Inject constructor(
                     expectedLastHeartbeat = plannedInstance.lastHeartbeat,
                     transitionAt = now
                 )
-                if (
-                    result == StopDispatchResult.TARGET_UNAVAILABLE ||
-                    result == StopDispatchResult.SUBMISSION_FAILED
-                ) {
+                if (result == StopDispatchResult.TARGET_UNAVAILABLE) {
+                    finalizeAbandonedStopping(
+                        instanceId = instanceId,
+                        liveWrapperIds = emptySet(),
+                        expectedLastHeartbeat = plannedInstance.lastHeartbeat,
+                        now = now,
+                        targetVerifiedUnavailable = true
+                    )
+                } else if (result == StopDispatchResult.SUBMISSION_FAILED) {
                     val currentLiveWrapperIds = hazelcastInstance.cluster.members
                         .mapTo(mutableSetOf()) { it.uuid.toString() }
                     finalizeAbandonedStopping(
@@ -172,14 +177,15 @@ class InstanceCountEnforcer @Inject constructor(
         instanceId: String,
         liveWrapperIds: Set<String>,
         expectedLastHeartbeat: Long,
-        now: Long
+        now: Long,
+        targetVerifiedUnavailable: Boolean = false
     ) {
         val instance = clusterStateService.getInstance(instanceId) ?: return
         if (
             instance.state != InstanceState.STOPPING ||
             instance.lastHeartbeat != expectedLastHeartbeat ||
             !isStale(instance.lastHeartbeat, now, STOPPING_TIMEOUT_MS) ||
-            instance.wrapperNodeId in liveWrapperIds
+            (!targetVerifiedUnavailable && instance.wrapperNodeId in liveWrapperIds)
         ) {
             return
         }

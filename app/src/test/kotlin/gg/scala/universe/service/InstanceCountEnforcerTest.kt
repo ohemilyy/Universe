@@ -1,6 +1,7 @@
 package gg.scala.universe.service
 
 import com.hazelcast.cluster.Member
+import com.hazelcast.cluster.MembershipEvent
 import com.hazelcast.config.Config
 import com.hazelcast.core.MemberLeftException
 import com.hazelcast.core.EntryEvent
@@ -10,6 +11,7 @@ import com.hazelcast.map.listener.EntryRemovedListener
 import com.hazelcast.map.listener.EntryUpdatedListener
 import gg.scala.universe.config.UniverseMainConfiguration
 import gg.scala.universe.hz.ClusterStateService
+import gg.scala.universe.hz.ResilienceMembershipListener
 import gg.scala.universe.hz.task.TaskDispatcher
 import gg.scala.universe.hz.task.TaskRouter
 import gg.scala.universe.hz.task.StopTaskSubmissionGateway
@@ -141,6 +143,39 @@ class InstanceCountEnforcerTest {
         assertEquals(0, state.getNodeResources("departed").usedCpu)
         assertEquals(InstanceState.ONLINE, state.getInstance("new001")?.state)
         assertTrue(stopDispatcher.invocations.isEmpty())
+    }
+
+    @Test
+    fun `member removal preserves stopping until enforcement reaps it`() {
+        val departedId = UUID.randomUUID()
+        state.addNodeResources(departedId.toString(), configuration.ramMB, configuration.cpu)
+        state.putInstance(
+            instance(
+                id = "old001",
+                state = InstanceState.STOPPING,
+                wrapper = departedId.toString(),
+                lastHeartbeat = 0
+            )
+        )
+        val departedMember = absentMember(departedId)
+        val event = MembershipEvent(
+            hazelcastInstance.cluster,
+            departedMember,
+            MembershipEvent.MEMBER_REMOVED,
+            hazelcastInstance.cluster.members
+        )
+
+        ResilienceMembershipListener(state).memberRemoved(event)
+
+        assertEquals(InstanceState.STOPPING, state.getInstance("old001")?.state)
+        assertEquals(0, state.getInstance("old001")?.lastHeartbeat)
+
+        enforcer(StateWritingSpawner(state, localMemberId())).enforceOnce(now = 120_001)
+
+        assertNull(state.getInstance("old001"))
+        assertEquals(InstanceState.ONLINE, state.getInstance("new001")?.state)
+        assertEquals(0, state.getNodeResources(departedId.toString()).usedRamMB)
+        assertEquals(0, state.getNodeResources(departedId.toString()).usedCpu)
     }
 
     @Test
@@ -383,6 +418,51 @@ class InstanceCountEnforcerTest {
     }
 
     @Test
+    fun `target unavailable overrides stale membership but preserves newer transition`() {
+        val wrapperId = localMemberId()
+        state.addNodeResources(
+            wrapperId,
+            ramMB = configuration.ramMB * 2 + 32,
+            cpu = configuration.cpu * 2 + 2
+        )
+        state.putInstance(
+            instance("old001", InstanceState.STOPPING, wrapperId, lastHeartbeat = 0)
+        )
+        state.putInstance(
+            instance("old002", InstanceState.STOPPING, wrapperId, lastHeartbeat = 0)
+        )
+        val dispatcher = TaskDispatcher(
+            hazelcastInstance,
+            state,
+            StopTaskSubmissionGateway { task, _ ->
+                if (task.instanceId == "old002") {
+                    val current = assertNotNull(state.getInstance(task.instanceId))
+                    state.putInstance(
+                        current.copy(state = InstanceState.ONLINE, lastHeartbeat = 77)
+                    )
+                }
+                CompletableFuture.failedFuture(MemberLeftException("member left"))
+            }
+        )
+        val enforcer = InstanceCountEnforcer(
+            clusterStateService = state,
+            hazelcastInstance = hazelcastInstance,
+            instanceStopDispatcher = dispatcher,
+            instanceSpawner = StateWritingSpawner(state, wrapperId),
+            configuration = UniverseMainConfiguration(isMasterNode = true)
+        )
+
+        enforcer.enforceOnce(now = 120_001)
+
+        assertNull(state.getInstance("old001"))
+        assertEquals(InstanceState.ONLINE, state.getInstance("old002")?.state)
+        assertEquals(77, state.getInstance("old002")?.lastHeartbeat)
+        assertEquals(configuration.ramMB + 32, state.getNodeResources(wrapperId).usedRamMB)
+        assertEquals(configuration.cpu + 2, state.getNodeResources(wrapperId).usedCpu)
+        assertNull(state.getInstance("new001"))
+    }
+
+    @Test
     fun `accepted stop submission wait is bounded`() {
         val wrapperId = localMemberId()
         state.putInstance(
@@ -409,6 +489,34 @@ class InstanceCountEnforcerTest {
         assertEquals(StopDispatchResult.DISPATCHED, result)
         assertTrue(elapsedMs < 2_000, "dispatch waited ${elapsedMs}ms")
         assertEquals(120_001, state.getInstance("old001")?.lastHeartbeat)
+    }
+
+    @Test
+    fun `task dispatcher cannot overwrite claimed stopped snapshot`() {
+        val wrapperId = localMemberId()
+        state.addNodeResources(wrapperId, configuration.ramMB, configuration.cpu)
+        state.putInstance(
+            instance("old001", InstanceState.STOPPING, wrapperId, lastHeartbeat = 0)
+        )
+        assertTrue(state.claimAbandonedStopping("old001", 0, stoppedAt = 120_001))
+        val dispatcher = TaskDispatcher(
+            hazelcastInstance,
+            state,
+            StopTaskSubmissionGateway { _, _ -> CompletableFuture.completedFuture("ignored") }
+        )
+
+        val result = dispatcher.dispatchStop(
+            instanceId = "old001",
+            targetMember = hazelcastInstance.cluster.localMember,
+            force = true,
+            transitionAt = 120_002
+        )
+
+        assertEquals(StopDispatchResult.NOT_FOUND, result)
+        assertEquals(InstanceState.STOPPED, state.getInstance("old001")?.state)
+        assertEquals(120_001, state.getInstance("old001")?.lastHeartbeat)
+        assertEquals(1, state.completePendingAbandonedStoppingCleanups())
+        assertNull(state.getInstance("old001"))
     }
 
     @Test

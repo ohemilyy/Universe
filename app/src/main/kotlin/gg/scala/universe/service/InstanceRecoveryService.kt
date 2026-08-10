@@ -137,7 +137,10 @@ class InstanceRecoveryService @Inject constructor(
             state = InstanceState.ONLINE,
             lastHeartbeat = System.currentTimeMillis()
         )
-        clusterStateService.putInstance(updated)
+        if (!clusterStateService.putInstance(updated)) {
+            log("Recovery of instance ${instance.id} was superseded by cleanup", LogLevel.WARNING)
+            return false
+        }
 
         // Re-allocate port to mark it as used
         portAllocator.reserve(instance.allocatedPort)
@@ -151,8 +154,6 @@ class InstanceRecoveryService @Inject constructor(
 
     private fun cleanupDeadInstance(instance: InstanceInfo, config: gg.scala.universe.schema.Configuration?) {
         portAllocator.release(instance.allocatedPort)
-        clusterStateService.removeNodeResources(instance.wrapperNodeId, instance.allocatedRamMB, instance.allocatedCpu)
-
         if (config?.static != true) {
             val workingDir = Paths.get("./running/${instance.id}").toAbsolutePath().normalize()
             try {
@@ -166,6 +167,9 @@ class InstanceRecoveryService @Inject constructor(
             }
         }
 
-        clusterStateService.updateInstanceState(instance.id, InstanceState.OFFLINE)
+        clusterStateService.completeInstanceTermination(
+            expectedInstance = instance,
+            finalState = InstanceState.OFFLINE
+        )
     }
 }
