@@ -4,6 +4,7 @@
 
 [versions]
 kotlin = "2.4.0"
+junit = "6.0.3"
 shadow = "9.5.0"
 jib = "3.5.3"
 gradle-git-properties = "2.5.7"
@@ -47,6 +48,8 @@ dependencyDownload = { module = "dev.vankka:dependencydownload-runtime", version
 
 # kotlin
 kotlinGradlePlugin = { module = "org.jetbrains.kotlin:kotlin-gradle-plugin", version.ref = "kotlin" }
+kotlin-test-junit5 = { module = "org.jetbrains.kotlin:kotlin-test-junit5", version.ref = "kotlin" }
+junit-jupiter-engine = { module = "org.junit.jupiter:junit-jupiter-engine", version.ref = "junit" }
 
 # hazelcast
 hazelcast = { module = "com.hazelcast:hazelcast", version.ref = "hazelcast" }

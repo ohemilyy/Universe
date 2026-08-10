@@ -1,5 +1,6 @@
 import com.gorylenko.GenerateGitPropertiesTask
 import dev.vankka.dependencydownload.task.GenerateDependencyDownloadResourceTask
+import org.gradle.api.tasks.testing.Test
 import org.gradle.kotlin.dsl.build
 import org.gradle.kotlin.dsl.invoke
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
@@ -76,6 +77,10 @@ subprojects {
 
     tasks.withType<GenerateGitPropertiesTask> {
         outputs.upToDateWhen { false }
+    }
+
+    tasks.withType<Test>().configureEach {
+        useJUnitPlatform()
     }
 
     val git = project.extra["git"] as Map<*, *>

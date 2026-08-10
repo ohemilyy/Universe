@@ -94,21 +94,11 @@ class K8sRuntimeProvider(
             .withWorkingDir(config.workingDir)
             .withStdin(true)
             .withTty(true)
-            .addNewPort()
-                .withContainerPort(port)
-                .withHostPort(port)
-                .withProtocol("TCP")
-            .endPort()
+            .withPorts(K8sPortSpec.build(port, configuration.additionalPorts, config.hostPortBindAddress))
 
         // Add additional ports from the instance configuration (e.g. voice chat, metrics)
         configuration.additionalPorts.forEach { ap ->
             val proto = if (ap.protocol.equals("udp", ignoreCase = true)) "UDP" else "TCP"
-            containerBuilder.addNewPort()
-                .withContainerPort(ap.port)
-                .withHostPort(ap.port)
-                .withProtocol(proto)
-                .withName(ap.name.ifBlank { "port-${ap.port}" })
-                .endPort()
             log("K8s pod '$podName' additional port: ${ap.port}/$proto${if (ap.name.isNotBlank()) " (${ap.name})" else ""}")
         }
 
@@ -183,6 +173,9 @@ class K8sRuntimeProvider(
             }.build()
             containerBuilder.withResources(resources)
         }
+
+        val hostPortBindAddress = K8sPortSpec.resolveHostIp(config.hostPortBindAddress)
+        log("K8s pod '$podName' hostPort bind address: ${hostPortBindAddress ?: "wildcard (hostIP omitted)"}")
 
         // Environment variables
         val allEnv = mutableMapOf<String, String>()
