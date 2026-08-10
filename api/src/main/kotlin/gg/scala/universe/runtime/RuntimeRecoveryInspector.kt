@@ -7,6 +7,7 @@ enum class RuntimeResourceState {
     ABSENT,
     RUNNING,
     PRESENT_TRANSITIONAL,
+    CLEANUP_REQUIRED,
     TERMINAL,
     UNKNOWN
 }

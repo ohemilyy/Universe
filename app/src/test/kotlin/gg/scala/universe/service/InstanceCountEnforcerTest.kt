@@ -405,6 +405,31 @@ class InstanceCountEnforcerTest {
     }
 
     @Test
+    fun `synchronous submission exception retains stopping because acceptance is uncertain`() {
+        val wrapperId = localMemberId()
+        state.putInstance(
+            instance("old001", InstanceState.STOPPING, wrapperId, lastHeartbeat = 0)
+        )
+        val dispatcher = TaskDispatcher(
+            hazelcastInstance,
+            state,
+            StopTaskSubmissionGateway { _, _ -> error("transport failed after possible acceptance") }
+        )
+
+        val result = dispatcher.dispatchStop(
+            instanceId = "old001",
+            targetMember = hazelcastInstance.cluster.localMember,
+            force = true,
+            expectedLastHeartbeat = 0,
+            transitionAt = 120_001
+        )
+
+        assertEquals(StopDispatchResult.SUBMISSION_FAILED, result)
+        assertEquals(InstanceState.STOPPING, state.getInstance("old001")?.state)
+        assertEquals(120_001, state.getInstance("old001")?.lastHeartbeat)
+    }
+
+    @Test
     fun `submission failure cannot roll a newer online transition back to stopping`() {
         val wrapperId = localMemberId()
         state.putInstance(

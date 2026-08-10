@@ -383,20 +383,32 @@ class TaskRouter @Inject constructor(
         lifecycleCoordinator.beginShutdown()
 
         // Stop all instances assigned to this node
-        val localInstances = clusterStateService.getAllInstances()
-            .filter { it.wrapperNodeId == hazelcastInstance.cluster.localMember.uuid.toString() }
+        val localNodeId = hazelcastInstance.cluster.localMember.uuid.toString()
+        val localInstanceIds = clusterStateService.getAllInstances()
+            .filter { it.wrapperNodeId == localNodeId }
             .filter {
                 it.state == InstanceState.ONLINE ||
                     it.state == InstanceState.CREATING ||
                     it.state == InstanceState.STOPPING
             }
-            .map { it to clusterStateService.getLifecycleGeneration(it.id) }
+            .map { it.id }
 
-        localInstances.forEach { (instance, expectedGeneration) ->
+        localInstanceIds.forEach { instanceId ->
             try {
-                lifecycleCoordinator.withInstance(instance.id) {
+                lifecycleCoordinator.withInstance(instanceId) {
+                    val latest = clusterStateService.getInstance(instanceId)
+                        ?: return@withInstance
+                    if (
+                        latest.wrapperNodeId != localNodeId ||
+                        latest.state !in setOf(
+                            InstanceState.CREATING,
+                            InstanceState.ONLINE,
+                            InstanceState.STOPPING
+                        )
+                    ) return@withInstance
+                    val expectedGeneration = clusterStateService.getLifecycleGeneration(instanceId)
                     val (claimed, claimedGeneration) = clusterStateService.claimForShutdown(
-                        instance, expectedGeneration
+                        latest, expectedGeneration
                     ) ?: return@withInstance
                     val runtimeProvider = runtimeRegistry.get(claimed.runtime)
                         ?: error("No runtime provider '${claimed.runtime}' available for ${claimed.id}")
@@ -416,7 +428,7 @@ class TaskRouter @Inject constructor(
                     log("Stopped instance ${claimed.id} during shutdown")
                 }
             } catch (e: Exception) {
-                log("Failed to stop instance ${instance.id} during shutdown: ${e.message}", LogLevel.WARNING)
+                log("Failed to stop instance $instanceId during shutdown: ${e.message}", LogLevel.WARNING)
             }
         }
 

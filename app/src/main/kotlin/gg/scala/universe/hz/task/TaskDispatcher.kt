@@ -137,9 +137,6 @@ class TaskDispatcher @Inject constructor(
                 targetMember
             )
         } catch (failure: RuntimeException) {
-            restoreTransitionIfCurrent(
-                stoppingInstance, originalInstance, stoppingGeneration, originalGeneration
-            )
             return submissionFailureResult(targetMember, failure)
         }
 
@@ -166,20 +163,6 @@ class TaskDispatcher @Inject constructor(
         } catch (failure: ExecutionException) {
             submissionFailureResult(targetMember, failure.cause ?: failure)
         }
-    }
-
-    private fun restoreTransitionIfCurrent(
-        stoppingInstance: InstanceInfo,
-        originalInstance: InstanceInfo,
-        stoppingGeneration: Long,
-        originalGeneration: Long
-    ) {
-        clusterStateService.transitionLifecycle(
-            stoppingInstance,
-            stoppingGeneration,
-            originalInstance,
-            originalGeneration
-        )
     }
 
     private fun submissionFailureResult(

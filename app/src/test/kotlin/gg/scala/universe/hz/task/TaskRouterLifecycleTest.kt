@@ -333,7 +333,7 @@ class TaskRouterLifecycleTest {
 
         assertEquals(InstanceState.CREATING, state.getInstance("new001")?.state)
         assertTrue(runtime.operations.isEmpty())
-        assertEquals(0, coordinator.trackedLockCount())
+        assertEquals(1, coordinator.trackedLockCount())
     }
 
     @Test

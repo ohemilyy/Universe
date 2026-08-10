@@ -104,7 +104,7 @@ class InstanceRecoveryService @Inject constructor(
                 log("Runtime state for ${durable.id} is $state; retaining lifecycle ownership", LogLevel.WARNING)
                 return false
             }
-            RuntimeResourceState.TERMINAL -> {
+            RuntimeResourceState.CLEANUP_REQUIRED, RuntimeResourceState.TERMINAL -> {
                 try {
                     provider.stop(durable.id)
                     val confirmed = if (provider is RuntimeRecoveryInspector) {

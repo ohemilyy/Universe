@@ -91,6 +91,7 @@ class InstanceHealthMonitor @Inject constructor(
                     when (runtimeState) {
                         RuntimeResourceState.RUNNING -> Unit
                         RuntimeResourceState.ABSENT -> markOffline(instance, config)
+                        RuntimeResourceState.CLEANUP_REQUIRED,
                         RuntimeResourceState.TERMINAL -> {
                             runtimeProvider.stop(instance.id)
                             markOffline(instance, config)

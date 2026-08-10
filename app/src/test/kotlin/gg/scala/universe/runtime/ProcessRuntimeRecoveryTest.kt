@@ -8,6 +8,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.stream.Stream
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 
 class ProcessRuntimeRecoveryTest {
@@ -38,6 +39,45 @@ class ProcessRuntimeRecoveryTest {
             RuntimeResourceState.UNKNOWN,
             provider.inspectRecovered("old001", 42, Path.of("work"))
         )
+    }
+
+    @Test
+    fun `stop before durable pid recovery cannot claim confirmed absence`() {
+        val provider = ProcessRuntimeProvider(object : ProcessIdentityLookup {
+            override fun find(pid: Long): ProcessHandle = FakeHandle(pid)
+            override fun matchesWorkingDirectory(pid: Long, expected: Path) = true
+        })
+
+        assertFailsWith<IllegalStateException> { provider.stop("old001") }
+    }
+
+    @Test
+    fun `crash before pid publication remains unknown and retains teardown ownership`() {
+        val provider = ProcessRuntimeProvider(object : ProcessIdentityLookup {
+            override fun find(pid: Long): ProcessHandle? = null
+            override fun matchesWorkingDirectory(pid: Long, expected: Path) = false
+        })
+
+        assertEquals(
+            RuntimeResourceState.UNKNOWN,
+            provider.inspectRecovered("old001", null, Path.of("work"))
+        )
+        assertFailsWith<IllegalStateException> { provider.stop("old001") }
+    }
+
+    @Test
+    fun `durable dead pid inspection permits idempotent confirmed stop`() {
+        val provider = ProcessRuntimeProvider(object : ProcessIdentityLookup {
+            override fun find(pid: Long): ProcessHandle? = null
+            override fun matchesWorkingDirectory(pid: Long, expected: Path) = false
+        })
+
+        assertEquals(
+            RuntimeResourceState.ABSENT,
+            provider.inspectRecovered("old001", 42, Path.of("work"))
+        )
+        provider.stop("old001")
+        provider.stop("old001")
     }
 
     private class FakeHandle(private val value: Long) : ProcessHandle {

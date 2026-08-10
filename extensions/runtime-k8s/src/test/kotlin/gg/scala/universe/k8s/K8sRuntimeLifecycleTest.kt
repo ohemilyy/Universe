@@ -2,6 +2,7 @@ package gg.scala.universe.k8s
 
 import gg.scala.universe.runtime.RuntimeResourceState
 import io.fabric8.kubernetes.api.model.PodBuilder
+import io.fabric8.kubernetes.api.model.PodListBuilder
 import io.fabric8.kubernetes.api.model.StatusBuilder
 import io.fabric8.kubernetes.api.model.ServiceBuilder
 import io.fabric8.kubernetes.client.NamespacedKubernetesClient
@@ -135,5 +136,37 @@ class K8sRuntimeLifecycleTest {
         val provider = K8sRuntimeProvider(K8sConfig(namespace = "test", timeoutSeconds = 1), client)
 
         assertFailsWith<IllegalStateException> { provider.stop(instanceId) }
+    }
+
+    @Test
+    fun `orphan service is cleanup required until confirmed deletion`() {
+        val instanceId = "orphan1"
+        val podPath = "/api/v1/namespaces/test/pods/universe-$instanceId"
+        val podListPath = "/api/v1/namespaces/test/pods?labelSelector=app%3Duniverse%2Cuniverse-instance-id%3D$instanceId"
+        val servicePath = "/api/v1/namespaces/test/services/universe-$instanceId"
+        val service = ServiceBuilder()
+                .withNewMetadata()
+                    .withName("universe-$instanceId")
+                    .withNamespace("test")
+                .endMetadata()
+                .build()
+        server.expect().get().withPath(podPath).andReturn(404, "").always()
+        server.expect().get().withPath(podListPath).andReturn(200, PodListBuilder().build()).always()
+        server.expect().get().withPath(servicePath).andReturn(200, service).once()
+        server.expect().delete().withPath(servicePath).andReturn(
+            200, StatusBuilder().withStatus("Success").build()
+        ).once()
+        server.expect().get().withPath(servicePath).andReturn(404, "").always()
+        val provider = K8sRuntimeProvider(K8sConfig(namespace = "test", timeoutSeconds = 1), client)
+
+        assertEquals(
+            RuntimeResourceState.CLEANUP_REQUIRED,
+            provider.inspectRecovered(instanceId, null, Path.of("work"))
+        )
+        provider.stop(instanceId)
+        assertEquals(
+            RuntimeResourceState.ABSENT,
+            provider.inspectRecovered(instanceId, null, Path.of("work"))
+        )
     }
 }

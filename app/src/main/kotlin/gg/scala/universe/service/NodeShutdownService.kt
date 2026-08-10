@@ -46,7 +46,7 @@ class NodeShutdownService @Inject constructor(
             return
         }
 
-        val localInstances = try {
+        val localInstanceIds = try {
             clusterStateService.getAllInstances()
                 .filter { it.wrapperNodeId == localNodeId }
                 .filter {
@@ -54,24 +54,35 @@ class NodeShutdownService @Inject constructor(
                         it.state == InstanceState.ONLINE ||
                         it.state == InstanceState.STOPPING
                 }
-                .map { it to clusterStateService.getLifecycleGeneration(it.id) }
+                .map { it.id }
         } catch (_: com.hazelcast.core.HazelcastInstanceNotActiveException) {
             log("Hazelcast already shut down, skipping local instance cleanup")
             return
         }
 
-        if (localInstances.isEmpty()) {
+        if (localInstanceIds.isEmpty()) {
             log("No local instances to stop")
             return
         }
 
-        log("Stopping ${localInstances.size} local instance(s) in parallel...")
+        log("Stopping ${localInstanceIds.size} local instance(s) in parallel...")
 
-        val futures = localInstances.map { (instance, expectedGeneration) ->
+        val futures = localInstanceIds.map { instanceId ->
             CompletableFuture.runAsync {
-                lifecycleCoordinator.withInstance(instance.id) {
+                lifecycleCoordinator.withInstance(instanceId) {
+                    val latest = clusterStateService.getInstance(instanceId)
+                        ?: return@withInstance
+                    if (
+                        latest.wrapperNodeId != localNodeId ||
+                        latest.state !in setOf(
+                            InstanceState.CREATING,
+                            InstanceState.ONLINE,
+                            InstanceState.STOPPING
+                        )
+                    ) return@withInstance
+                    val expectedGeneration = clusterStateService.getLifecycleGeneration(instanceId)
                     val (claimed, claimedGeneration) = clusterStateService.claimForShutdown(
-                        instance, expectedGeneration
+                        latest, expectedGeneration
                     ) ?: return@withInstance
                     val config = try {
                         clusterStateService.getConfiguration(claimed.configurationName)

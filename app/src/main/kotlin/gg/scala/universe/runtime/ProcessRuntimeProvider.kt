@@ -36,6 +36,7 @@ class ProcessRuntimeProvider internal constructor(
 ) : RuntimeProvider, RuntimeRecoveryInspector {
     private val processes = ConcurrentHashMap<String, Process>()
     private val recoveredHandles = ConcurrentHashMap<String, ProcessHandle>()
+    private val confirmedAbsentPids = ConcurrentHashMap<String, Long>()
 
     override fun start(
         instanceId: String,
@@ -56,6 +57,7 @@ class ProcessRuntimeProvider internal constructor(
             .redirectInput(ProcessBuilder.Redirect.PIPE)
         if (!environmentVariables.isNullOrEmpty()) builder.environment().putAll(environmentVariables)
         val process = builder.start()
+        confirmedAbsentPids.remove(instanceId)
         processes[instanceId] = process
         recoveredHandles[instanceId] = process.toHandle()
         CgroupResourceEnforcer.createCgroup(instanceId, ramMB, cpu)?.let {
@@ -70,19 +72,43 @@ class ProcessRuntimeProvider internal constructor(
         processPid: Long?,
         workingDirectory: Path
     ): RuntimeResourceState {
+        val tracked = processes[instanceId]?.toHandle() ?: recoveredHandles[instanceId]
+        if (tracked != null) {
+            return if (tracked.isAlive) {
+                confirmedAbsentPids.remove(instanceId)
+                RuntimeResourceState.RUNNING
+            } else {
+                confirmedAbsentPids[instanceId] = tracked.pid()
+                RuntimeResourceState.ABSENT
+            }
+        }
         processPid ?: return RuntimeResourceState.UNKNOWN
-        val handle = processLookup.find(processPid) ?: return RuntimeResourceState.ABSENT
-        if (!handle.isAlive) return RuntimeResourceState.ABSENT
+        val handle = processLookup.find(processPid)
+        if (handle == null || !handle.isAlive) {
+            confirmedAbsentPids[instanceId] = processPid
+            recoveredHandles.remove(instanceId)
+            return RuntimeResourceState.ABSENT
+        }
         if (!processLookup.matchesWorkingDirectory(processPid, workingDirectory)) {
+            confirmedAbsentPids.remove(instanceId)
             return RuntimeResourceState.UNKNOWN
         }
+        confirmedAbsentPids.remove(instanceId)
         recoveredHandles[instanceId] = handle
         return RuntimeResourceState.RUNNING
     }
 
     override fun stop(instanceId: String) {
         val process = processes[instanceId]
-        val handle = process?.toHandle() ?: recoveredHandles[instanceId] ?: return
+        val handle = process?.toHandle() ?: recoveredHandles[instanceId]
+        if (handle == null) {
+            check(confirmedAbsentPids[instanceId] != null) {
+                "Process identity for instance $instanceId is unknown; durable PID recovery is required"
+            }
+            CgroupResourceEnforcer.cleanupCgroup(instanceId)
+            log("Process for instance $instanceId was already confirmed absent")
+            return
+        }
         if (handle.isAlive) {
             handle.destroy()
             awaitExit(instanceId, handle, force = false)
@@ -95,6 +121,7 @@ class ProcessRuntimeProvider internal constructor(
         CgroupResourceEnforcer.cleanupCgroup(instanceId)
         process?.let { processes.remove(instanceId, it) }
         recoveredHandles.remove(instanceId, handle)
+        confirmedAbsentPids[instanceId] = handle.pid()
         log("Stopped process for instance $instanceId")
     }
 

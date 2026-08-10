@@ -352,9 +352,10 @@ class K8sRuntimeProvider private constructor(
     ): RuntimeResourceState {
         val k8s = try { requireClient() } catch (_: Exception) { return RuntimeResourceState.UNKNOWN }
         return try {
-            val podName = discoverPodName(k8s, instanceId) ?: return RuntimeResourceState.ABSENT
+            val podName = discoverPodName(k8s, instanceId)
+                ?: return inspectRecoveredService(k8s, instanceId)
             val pod = k8s.pods().inNamespace(config.namespace).withName(podName).get()
-                ?: return RuntimeResourceState.ABSENT
+                ?: return inspectRecoveredService(k8s, instanceId)
             podNames[instanceId] = podName
             when (pod.status?.phase) {
                 "Running" -> RuntimeResourceState.RUNNING
@@ -365,6 +366,16 @@ class K8sRuntimeProvider private constructor(
         } catch (_: Exception) {
             RuntimeResourceState.UNKNOWN
         }
+    }
+
+    private fun inspectRecoveredService(
+        k8s: KubernetesClient,
+        instanceId: String
+    ): RuntimeResourceState {
+        val service = k8s.services().inNamespace(config.namespace)
+            .withName("universe-$instanceId").get()
+        return if (service == null) RuntimeResourceState.ABSENT
+        else RuntimeResourceState.CLEANUP_REQUIRED
     }
 
     override fun getHostAddress(instanceId: String): String {
