@@ -21,6 +21,10 @@ allprojects {
     version = "0.0.1"
     group = ""
 
+    tasks.withType<Test>().configureEach {
+        useJUnitPlatform()
+    }
+
     repositories {
         mavenCentral()
         maven("https://repo.papermc.io/repository/maven-public/")
@@ -77,10 +81,6 @@ subprojects {
 
     tasks.withType<GenerateGitPropertiesTask> {
         outputs.upToDateWhen { false }
-    }
-
-    tasks.withType<Test>().configureEach {
-        useJUnitPlatform()
     }
 
     val git = project.extra["git"] as Map<*, *>
