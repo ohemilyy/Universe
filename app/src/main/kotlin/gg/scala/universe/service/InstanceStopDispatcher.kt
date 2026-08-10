@@ -5,6 +5,8 @@ import com.hazelcast.cluster.Member
 enum class StopDispatchResult {
     DISPATCHED,
     ALREADY_STOPPING,
+    STALE_TRANSITION,
+    TARGET_UNAVAILABLE,
     NOT_FOUND
 }
 
@@ -20,6 +22,8 @@ internal fun StopDispatchResult.toRequestOutcome(restart: Boolean): StopDispatch
     StopDispatchResult.ALREADY_STOPPING -> {
         if (restart) StopDispatchOutcome.CONFLICT else StopDispatchOutcome.IDEMPOTENT
     }
+    StopDispatchResult.STALE_TRANSITION -> StopDispatchOutcome.CONFLICT
+    StopDispatchResult.TARGET_UNAVAILABLE -> StopDispatchOutcome.NOT_FOUND
     StopDispatchResult.NOT_FOUND -> StopDispatchOutcome.NOT_FOUND
 }
 
@@ -28,6 +32,8 @@ interface InstanceStopDispatcher {
         instanceId: String,
         targetMember: Member,
         force: Boolean = false,
-        restart: Boolean = false
+        restart: Boolean = false,
+        expectedLastHeartbeat: Long? = null,
+        transitionAt: Long = System.currentTimeMillis()
     ): StopDispatchResult
 }

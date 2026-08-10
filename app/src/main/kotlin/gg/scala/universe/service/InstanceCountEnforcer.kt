@@ -7,6 +7,7 @@ import gg.scala.universe.console.LogLevel
 import gg.scala.universe.console.log
 import gg.scala.universe.config.UniverseMainConfiguration
 import gg.scala.universe.hz.ClusterStateService
+import gg.scala.universe.schema.Configuration
 import gg.scala.universe.schema.InstanceState
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -16,7 +17,7 @@ import java.util.concurrent.TimeUnit
  * new instances when the running count drops below the configured minimum.
  *
  * Runs on the master node every 5 seconds. Uses a single-threaded executor
- * to avoid race conditions. Static configurations are ignored.
+ * to avoid race conditions. Static configurations spawn at most one instance per pass.
  */
 @Singleton
 class InstanceCountEnforcer @Inject constructor(
@@ -75,6 +76,7 @@ class InstanceCountEnforcer @Inject constructor(
         val liveMembers = hazelcastInstance.cluster.members.associateBy { it.uuid.toString() }
         val liveWrapperIds = liveMembers.keys
         val allInstances = clusterStateService.getAllInstances()
+        val plannedInstancesById = allInstances.associateBy { it.id }
 
         for (instanceConfiguration in clusterStateService.configurations.values) {
             val plan = InstanceReconciliationPolicy.plan(
@@ -88,20 +90,40 @@ class InstanceCountEnforcer @Inject constructor(
                 reapStaleCreating(instanceId, now)
             }
             plan.abandonedStoppingIds.forEach { instanceId ->
-                finalizeAbandonedStopping(instanceId, liveWrapperIds, now)
+                val plannedInstance = plannedInstancesById[instanceId] ?: return@forEach
+                finalizeAbandonedStopping(
+                    instanceId,
+                    liveWrapperIds,
+                    plannedInstance.lastHeartbeat,
+                    now
+                )
             }
             plan.forceStopIds.forEach { instanceId ->
-                val stopping = refreshStoppingTransition(instanceId, now) ?: return@forEach
-                val member = liveMembers[stopping.wrapperNodeId] ?: return@forEach
-                instanceStopDispatcher.dispatchStop(
+                val plannedInstance = plannedInstancesById[instanceId] ?: return@forEach
+                val member = liveMembers[plannedInstance.wrapperNodeId] ?: return@forEach
+                val result = instanceStopDispatcher.dispatchStop(
                     instanceId = instanceId,
                     targetMember = member,
                     force = true,
-                    restart = false
+                    restart = false,
+                    expectedLastHeartbeat = plannedInstance.lastHeartbeat,
+                    transitionAt = now
                 )
+                if (result == StopDispatchResult.TARGET_UNAVAILABLE) {
+                    val currentLiveWrapperIds = hazelcastInstance.cluster.members
+                        .mapTo(mutableSetOf()) { it.uuid.toString() }
+                    finalizeAbandonedStopping(
+                        instanceId,
+                        currentLiveWrapperIds,
+                        plannedInstance.lastHeartbeat,
+                        now
+                    )
+                }
             }
 
-            if (plan.spawnCount <= 0) continue
+            if (plan.spawnCount <= 0 || !stillHasPlannedDeficit(instanceConfiguration, plan.spawnCount)) {
+                continue
+            }
             log(
                 "Config '${instanceConfiguration.name}' is below its minimum. " +
                     "Spawning ${plan.spawnCount} instance(s)...",
@@ -145,53 +167,45 @@ class InstanceCountEnforcer @Inject constructor(
     private fun finalizeAbandonedStopping(
         instanceId: String,
         liveWrapperIds: Set<String>,
+        expectedLastHeartbeat: Long,
         now: Long
     ) {
-        val instances = clusterStateService.instances
-        instances.lock(instanceId)
-        try {
-            val instance = instances[instanceId] ?: return
-            if (
-                instance.state != InstanceState.STOPPING ||
-                !isStale(instance.lastHeartbeat, now, STOPPING_TIMEOUT_MS) ||
-                instance.wrapperNodeId in liveWrapperIds
-            ) {
-                return
-            }
-
-            clusterStateService.removeNodeResources(
-                instance.wrapperNodeId,
-                instance.allocatedRamMB,
-                instance.allocatedCpu
-            )
-            instances[instanceId] = instance.copy(
-                state = InstanceState.STOPPED,
-                lastHeartbeat = now
-            )
-            instances.remove(instanceId)
-        } finally {
-            instances.unlock(instanceId)
+        val instance = clusterStateService.getInstance(instanceId) ?: return
+        if (
+            instance.state != InstanceState.STOPPING ||
+            instance.lastHeartbeat != expectedLastHeartbeat ||
+            !isStale(instance.lastHeartbeat, now, STOPPING_TIMEOUT_MS) ||
+            instance.wrapperNodeId in liveWrapperIds
+        ) {
+            return
         }
+
+        clusterStateService.finalizeAbandonedStopping(
+            instanceId = instanceId,
+            expectedLastHeartbeat = expectedLastHeartbeat,
+            stoppedAt = now
+        )
     }
-
-    private fun refreshStoppingTransition(instanceId: String, now: Long) =
-        clusterStateService.instances.let { instances ->
-            instances.lock(instanceId)
-            try {
-                val instance = instances[instanceId] ?: return@let null
-                if (
-                    instance.state != InstanceState.STOPPING ||
-                    !isStale(instance.lastHeartbeat, now, STOPPING_TIMEOUT_MS)
-                ) {
-                    return@let null
-                }
-                instance.copy(lastHeartbeat = now).also { instances[instanceId] = it }
-            } finally {
-                instances.unlock(instanceId)
-            }
-        }
 
     private fun isStale(lastHeartbeat: Long, now: Long, timeoutMs: Long): Boolean {
         return lastHeartbeat < now && now - lastHeartbeat > timeoutMs
+    }
+
+    private fun stillHasPlannedDeficit(
+        instanceConfiguration: Configuration,
+        plannedSpawnCount: Int
+    ): Boolean {
+        val currentMatchingInstances = clusterStateService.getAllInstances()
+            .filter { it.configurationName == instanceConfiguration.name }
+        val currentStatus = InstanceLifecyclePolicy.minimumStatus(
+            instanceConfiguration.name,
+            currentMatchingInstances
+        )
+        if (currentStatus.replacementBlocked) return false
+
+        val currentDeficit = (
+            instanceConfiguration.minimumServiceCount - currentStatus.countedInstances
+        ).coerceAtLeast(0)
+        return currentDeficit >= plannedSpawnCount
     }
 }

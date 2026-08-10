@@ -40,29 +40,42 @@ class TaskDispatcher @Inject constructor(
         instanceId: String,
         targetMember: Member,
         force: Boolean,
-        restart: Boolean
+        restart: Boolean,
+        expectedLastHeartbeat: Long?,
+        transitionAt: Long
     ): StopDispatchResult {
         val instances = clusterStateService.instances
         instances.lock(instanceId)
         try {
-            val instance = clusterStateService.getInstance(instanceId)
+            val instance = instances[instanceId]
                 ?: return StopDispatchResult.NOT_FOUND
+            if (
+                expectedLastHeartbeat != null &&
+                (instance.state != InstanceState.STOPPING ||
+                    instance.lastHeartbeat != expectedLastHeartbeat)
+            ) {
+                return StopDispatchResult.STALE_TRANSITION
+            }
             if (instance.state == InstanceState.STOPPING && !force) {
                 return StopDispatchResult.ALREADY_STOPPING
             }
+            if (
+                targetMember.uuid.toString() != instance.wrapperNodeId ||
+                hazelcastInstance.cluster.members.none { it.uuid == targetMember.uuid }
+            ) {
+                return StopDispatchResult.TARGET_UNAVAILABLE
+            }
 
-            clusterStateService.updateInstanceState(
-                instanceId,
-                InstanceState.STOPPING,
-                System.currentTimeMillis()
+            instances[instanceId] = instance.copy(
+                state = InstanceState.STOPPING,
+                lastHeartbeat = transitionAt
             )
+            log("Dispatching stop task for instance $instanceId to node ${targetMember.nodeName()}")
+            submit(StopInstanceTask(instanceId, force, restart), targetMember)
+            return StopDispatchResult.DISPATCHED
         } finally {
             instances.unlock(instanceId)
         }
-
-        log("Dispatching stop task for instance $instanceId to node ${targetMember.nodeName()}")
-        submit(StopInstanceTask(instanceId, force, restart), targetMember)
-        return StopDispatchResult.DISPATCHED
     }
 
     fun dispatchExecute(instanceId: String, command: String, targetMember: Member) {

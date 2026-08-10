@@ -4,6 +4,7 @@ import com.google.inject.Inject
 import com.hazelcast.core.HazelcastInstance
 import com.hazelcast.map.IMap
 import com.hazelcast.map.EntryProcessor
+import com.hazelcast.transaction.TransactionOptions
 import gg.scala.universe.schema.Configuration
 import gg.scala.universe.schema.InstanceInfo
 import gg.scala.universe.schema.InstanceState
@@ -94,6 +95,47 @@ class ClusterStateService @Inject constructor(
         } finally {
             instances.unlock(id)
         }
+    }
+
+    internal fun finalizeAbandonedStopping(
+        instanceId: String,
+        expectedLastHeartbeat: Long,
+        stoppedAt: Long
+    ): Boolean {
+        val transactionOptions = TransactionOptions().setTransactionType(
+            TransactionOptions.TransactionType.TWO_PHASE
+        )
+        val stoppedInstance = hazelcastInstance.executeTransaction(transactionOptions) { context ->
+            val transactionalInstances = context.getMap<String, InstanceInfo>("instances")
+            val instance = transactionalInstances.getForUpdate(instanceId)
+                ?: return@executeTransaction null
+            if (instance.state == InstanceState.STOPPED && instance.lastHeartbeat == stoppedAt) {
+                return@executeTransaction instance
+            }
+            if (
+                instance.state != InstanceState.STOPPING ||
+                instance.lastHeartbeat != expectedLastHeartbeat
+            ) {
+                return@executeTransaction null
+            }
+
+            val transactionalResources = context.getMap<String, NodeResources>("nodeResources")
+            val resources = transactionalResources.getForUpdate(instance.wrapperNodeId)
+                ?: NodeResources()
+            transactionalResources.put(
+                instance.wrapperNodeId,
+                NodeResources(
+                    usedRamMB = maxOf(0, resources.usedRamMB - instance.allocatedRamMB),
+                    usedCpu = maxOf(0, resources.usedCpu - instance.allocatedCpu)
+                )
+            )
+            instance.copy(state = InstanceState.STOPPED, lastHeartbeat = stoppedAt).also {
+                transactionalInstances.put(instanceId, it)
+            }
+        }
+        stoppedInstance ?: return false
+        instances.remove(instanceId, stoppedInstance)
+        return true
     }
 
     fun getNodeResources(nodeId: String): NodeResources {

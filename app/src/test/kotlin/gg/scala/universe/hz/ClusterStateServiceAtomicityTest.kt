@@ -13,6 +13,8 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class ClusterStateServiceAtomicityTest {
@@ -93,6 +95,32 @@ class ClusterStateServiceAtomicityTest {
             if (locked) instances.unlock(instanceId)
             executor.shutdownNow()
         }
+    }
+
+    @Test
+    fun `abandoned cleanup is idempotent and preserves unrelated resources`() {
+        val instanceId = "old001"
+        state.addNodeResources("node-1", ramMB = 96, cpu = 3)
+        state.putInstance(instance(instanceId, InstanceState.STOPPING, lastHeartbeat = 0))
+
+        assertTrue(
+            state.finalizeAbandonedStopping(
+                instanceId = instanceId,
+                expectedLastHeartbeat = 0,
+                stoppedAt = 120_001
+            )
+        )
+        assertFalse(
+            state.finalizeAbandonedStopping(
+                instanceId = instanceId,
+                expectedLastHeartbeat = 0,
+                stoppedAt = 120_001
+            )
+        )
+
+        assertNull(state.getInstance(instanceId))
+        assertEquals(32, state.getNodeResources("node-1").usedRamMB)
+        assertEquals(2, state.getNodeResources("node-1").usedCpu)
     }
 
     private fun instance(id: String, state: InstanceState, lastHeartbeat: Long) = InstanceInfo(
