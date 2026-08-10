@@ -14,6 +14,8 @@ import gg.scala.universe.hz.task.TaskDispatcher
 import gg.scala.universe.schema.InstanceState
 import gg.scala.universe.service.InstanceCreationService
 import gg.scala.universe.service.NodeShutdownService
+import gg.scala.universe.service.StopDispatchOutcome
+import gg.scala.universe.service.toRequestOutcome
 import gg.scala.universe.template.TemplateManager
 import io.ktor.server.application.Application
 import io.ktor.server.request.receive
@@ -228,8 +230,9 @@ class ManagementCommands @Inject constructor(
             it.uuid.toString() == instance.wrapperNodeId
         } ?: hazelcastInstance.cluster.localMember
 
-        taskDispatcher.dispatchStop(instanceId, member)
-        source.sendMessage("Stopping instance $instanceId...")
+        val outcome = taskDispatcher.dispatchStop(instanceId, member)
+            .toRequestOutcome(restart = false)
+        source.sendStopDispatchMessage(instanceId, restart = false, outcome)
     }
 
     @Command("instance|instances info <id>")
@@ -297,8 +300,9 @@ class ManagementCommands @Inject constructor(
         val member = hazelcastInstance.cluster.members.firstOrNull {
             it.uuid.toString() == instance.wrapperNodeId
         } ?: hazelcastInstance.cluster.localMember
-        taskDispatcher.dispatchStop(instanceId, member, restart = true)
-        source.sendMessage("Restart queued for instance $instanceId...")
+        val outcome = taskDispatcher.dispatchStop(instanceId, member, restart = true)
+            .toRequestOutcome(restart = true)
+        source.sendStopDispatchMessage(instanceId, restart = true, outcome)
     }
 
     @Command("instance|instances kill <id>")
@@ -316,8 +320,9 @@ class ManagementCommands @Inject constructor(
             it.uuid.toString() == instance.wrapperNodeId
         } ?: hazelcastInstance.cluster.localMember
 
-        taskDispatcher.dispatchStop(instanceId, member, force = true)
-        source.sendMessage("Force-stop dispatched for instance $instanceId.")
+        val outcome = taskDispatcher.dispatchStop(instanceId, member, force = true)
+            .toRequestOutcome(restart = false)
+        source.sendStopDispatchMessage(instanceId, restart = false, outcome, force = true)
     }
 
     @Command("instance|instances logs <id>")
@@ -523,4 +528,26 @@ class ManagementCommands @Inject constructor(
         source.sendMessage("  stop                    - Shutdown Universe")
     }
 
+}
+
+private fun CommandSource.sendStopDispatchMessage(
+    instanceId: String,
+    restart: Boolean,
+    outcome: StopDispatchOutcome,
+    force: Boolean = false
+) {
+    when (outcome) {
+        StopDispatchOutcome.ACCEPTED -> sendMessage(
+            when {
+                restart -> "Restart queued for instance $instanceId..."
+                force -> "Force-stop dispatched for instance $instanceId."
+                else -> "Stopping instance $instanceId..."
+            }
+        )
+        StopDispatchOutcome.IDEMPOTENT -> sendMessage("Instance $instanceId is already stopping.")
+        StopDispatchOutcome.CONFLICT -> sendMessage(
+            "Instance $instanceId is already stopping; restart was not queued."
+        )
+        StopDispatchOutcome.NOT_FOUND -> sendMessage("Instance '$instanceId' was no longer found; nothing was queued.")
+    }
 }

@@ -18,6 +18,7 @@ import gg.scala.universe.task.StopInstanceTask
 import gg.scala.universe.template.TemplateManager
 import gg.scala.universe.template.TemplateStorageRegistryImpl
 import gg.scala.universe.template.TemplateVariableRegistryImpl
+import gg.scala.universe.util.json.Serializers
 import java.net.ServerSocket
 import java.nio.file.Files
 import java.nio.file.Path
@@ -104,6 +105,35 @@ class TaskRouterLifecycleTest {
     }
 
     @Test
+    fun `missing runtime removes creating record`() {
+        configuration = configuration.copy(runtime = "missing")
+        state.putConfiguration(configuration)
+        state.putInstance(creatingInstance("new001", allocatedPort = 0))
+
+        router.route(DeployInstanceTask("new001", configuration.name))
+
+        assertNull(state.getInstance("new001"))
+    }
+
+    @Test
+    fun `post start host lookup failure cleans runtime port and working directory`() {
+        configuration = configuration.copy(static = false)
+        state.putConfiguration(configuration)
+        state.putInstance(creatingInstance("new001", allocatedPort = 0))
+        runtime.failHostLookup = true
+
+        val routingFailure = runCatching {
+            router.route(DeployInstanceTask("new001", configuration.name))
+        }.exceptionOrNull()
+
+        assertNull(routingFailure)
+        assertNull(state.getInstance("new001"))
+        assertTrue(singlePort !in portAllocator.getLocalAllocations())
+        assertEquals(listOf("start:new001", "stop:new001"), runtime.operations)
+        assertTrue(Files.notExists(Path.of("./running/new001")))
+    }
+
+    @Test
     fun `stop publishes stopped only after releasing port`() {
         portAllocator.reserve(singlePort)
         state.putInstance(onlineInstance("old001"))
@@ -136,6 +166,11 @@ class TaskRouterLifecycleTest {
         assertEquals(InstanceState.ONLINE, restarted.state)
         assertEquals(singlePort, restarted.allocatedPort)
         assertEquals(listOf("stop:old001", "start:old001"), runtime.operations)
+        val saved = Serializers.GSON.fromJson(
+            Files.readString(Path.of("./static/${configuration.name}/.universe-state.json")),
+            InstanceInfo::class.java
+        )
+        assertEquals(restarted, saved)
     }
 
     @Test
@@ -178,6 +213,7 @@ class TaskRouterLifecycleTest {
     private class RecordingRuntimeProvider : RuntimeProvider {
         val operations = mutableListOf<String>()
         var isRunningChecks = 0
+        var failHostLookup = false
 
         override fun start(
             instanceId: String,
@@ -202,6 +238,11 @@ class TaskRouterLifecycleTest {
         override fun isRunning(instanceId: String): Boolean {
             isRunningChecks++
             return false
+        }
+
+        override fun getHostAddress(instanceId: String): String {
+            if (failHostLookup) error("host lookup failed")
+            return ""
         }
 
         companion object {

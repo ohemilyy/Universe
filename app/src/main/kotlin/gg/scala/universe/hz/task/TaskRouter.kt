@@ -46,63 +46,64 @@ class TaskRouter @Inject constructor(
         log("Routing deploy task for instance ${task.instanceId}")
 
         val configuration = clusterStateService.getConfiguration(task.configurationName)
-            ?: return log("Configuration ${task.configurationName} not found for instance ${task.instanceId}", LogLevel.ERROR)
-
-
+            ?: return failQueuedDeployment(
+                task,
+                "Configuration ${task.configurationName} not found for instance ${task.instanceId}"
+            )
         val runtimeProvider = runtimeRegistry.get(configuration.runtime)
-            ?: return log("Runtime '${configuration.runtime}' not registered for instance ${task.instanceId}", LogLevel.ERROR)
-
-        val allocatedPort = portAllocator.allocate(configuration.availablePorts)
-        if (allocatedPort == null) {
-            clusterStateService.removeInstance(task.instanceId)
-            log(
-                "No available ports for instance ${task.instanceId} in range " +
-                    "${configuration.availablePorts.min}-${configuration.availablePorts.max}; " +
-                    "removed queued instance so reconciliation can retry",
-                LogLevel.ERROR
+            ?: return failQueuedDeployment(
+                task,
+                "Runtime '${configuration.runtime}' not registered for instance ${task.instanceId}"
             )
-            return
-        }
 
-        val workingDir = if (configuration.static) {
-            Paths.get("./static/${configuration.name}").toAbsolutePath().normalize()
-        } else {
-            Paths.get("./running/${task.instanceId}").toAbsolutePath().normalize()
-        }
-        workingDir.toFile().mkdirs()
+        var allocatedPort: Int? = null
+        var workingDir: Path? = null
+        var runtimeStartAttempted = false
+        var resourcesAdded = false
+        var resourceNodeId: String? = null
 
-        if (!configuration.static) {
-            templateManager.installTemplates(
-                configuration = configuration,
-                instanceId = task.instanceId,
-                allocatedPort = allocatedPort,
-                targetDir = workingDir
-            )
-        }
+        try {
+            allocatedPort = portAllocator.allocate(configuration.availablePorts)
+                ?: error(
+                    "No available ports for instance ${task.instanceId} in range " +
+                        "${configuration.availablePorts.min}-${configuration.availablePorts.max}"
+                )
 
-        // Build variable map for env var replacement
-        val variables = variableRegistry.collectVariables(configuration, task.instanceId, allocatedPort)
-        val envVars = configuration.environmentVariables.mapValues { (_, value) ->
-            var replaced = value
-            variables.forEach { (placeholder, replacement) ->
-                replaced = replaced.replace(placeholder, replacement)
+            workingDir = if (configuration.static) {
+                Paths.get("./static/${configuration.name}").toAbsolutePath().normalize()
+            } else {
+                Paths.get("./running/${task.instanceId}").toAbsolutePath().normalize()
             }
-            replaced
-        }
+            Files.createDirectories(workingDir)
 
-        // Resolve template variables in hostAddress BEFORE passing to runtime provider.
-        // Docker/K8s runtimes need the actual IP for port binding, not raw placeholders.
-        val resolvedHostAddress = run {
-            var addr = configuration.hostAddress
-            variables.forEach { (placeholder, replacement) ->
-                addr = addr.replace(placeholder, replacement)
+            if (!configuration.static) {
+                templateManager.installTemplates(
+                    configuration = configuration,
+                    instanceId = task.instanceId,
+                    allocatedPort = allocatedPort,
+                    targetDir = workingDir
+                )
             }
-            addr
-        }
-        val resolvedConfiguration = configuration.copy(hostAddress = resolvedHostAddress)
 
-        val processHandle = try {
-            runtimeProvider.start(
+            val variables = variableRegistry.collectVariables(configuration, task.instanceId, allocatedPort)
+            val envVars = configuration.environmentVariables.mapValues { (_, value) ->
+                var replaced = value
+                variables.forEach { (placeholder, replacement) ->
+                    replaced = replaced.replace(placeholder, replacement)
+                }
+                replaced
+            }
+            val resolvedHostAddress = run {
+                var address = configuration.hostAddress
+                variables.forEach { (placeholder, replacement) ->
+                    address = address.replace(placeholder, replacement)
+                }
+                address
+            }
+            val resolvedConfiguration = configuration.copy(hostAddress = resolvedHostAddress)
+
+            runtimeStartAttempted = true
+            val processHandle = runtimeProvider.start(
                 instanceId = task.instanceId,
                 workingDir = workingDir,
                 port = allocatedPort,
@@ -112,73 +113,55 @@ class TaskRouter @Inject constructor(
                 configuration = resolvedConfiguration,
                 environmentVariables = envVars,
             )
-        } catch (e: Exception) {
-            val cause = e.cause ?: e
-            val reason = "${cause.javaClass.simpleName}: ${cause.message ?: "no details"}"
-            log("Failed to start instance ${task.instanceId}: $reason", LogLevel.ERROR)
 
-            // Clean up: remove instance record
-            clusterStateService.removeInstance(task.instanceId)
+            val finalHostAddress = runtimeProvider.getHostAddress(task.instanceId)
+                .ifBlank { resolvedHostAddress }
+            val queued = clusterStateService.getInstance(task.instanceId)
+                ?: error("Queued instance ${task.instanceId} disappeared during deployment")
+            val online = queued.copy(
+                state = InstanceState.ONLINE,
+                allocatedPort = allocatedPort,
+                processPid = processHandle.pid(),
+                hostAddress = finalHostAddress,
+                runtime = configuration.runtime
+            )
+            clusterStateService.putInstance(online)
 
-            // Clean up working directory (skip for static instances)
-            if (!configuration.static) {
+            resourceNodeId = online.wrapperNodeId
+            clusterStateService.addNodeResources(resourceNodeId, configuration.ramMB, configuration.cpu)
+            resourcesAdded = true
+
+            writeStateFile(workingDir, online)
+            log("Instance ${task.instanceId} deployed with PID ${processHandle.pid()}", LogLevel.SUCCESS)
+        } catch (failure: Exception) {
+            if (runtimeStartAttempted) {
                 try {
-                    if (Files.exists(workingDir)) {
-                        Files.walk(workingDir)
-                            .sorted(Comparator.reverseOrder())
-                            .forEach { Files.deleteIfExists(it) }
-                        log("Cleaned up working directory for instance ${task.instanceId}")
-                    }
-                } catch (cleanupEx: Exception) {
-                    log("Failed to clean up working directory for instance ${task.instanceId}: ${cleanupEx.message}", LogLevel.WARNING)
+                    runtimeProvider.stop(task.instanceId)
+                } catch (stopFailure: Exception) {
+                    log(
+                        "Failed to stop runtime after deployment failure for ${task.instanceId}: ${stopFailure.message}",
+                        LogLevel.WARNING
+                    )
                 }
             }
+            allocatedPort?.let(portAllocator::release)
+            if (resourcesAdded && resourceNodeId != null) {
+                clusterStateService.removeNodeResources(resourceNodeId, configuration.ramMB, configuration.cpu)
+            }
+            if (!configuration.static && workingDir != null) {
+                cleanupWorkingDirectory(task.instanceId, workingDir)
+            }
+            clusterStateService.removeInstance(task.instanceId)
 
-            portAllocator.release(allocatedPort)
-            return
+            val cause = failure.cause ?: failure
+            val reason = "${cause.javaClass.simpleName}: ${cause.message ?: "no details"}"
+            log("Failed to deploy instance ${task.instanceId}: $reason; removed queued instance", LogLevel.ERROR)
         }
+    }
 
-        // Runtime may override the resolved host address (e.g. K8s pod IP).
-        val finalHostAddress = runtimeProvider.getHostAddress(task.instanceId)
-            .ifBlank { resolvedHostAddress }
-
-        // Update instance info in Hazelcast
-        val existing = clusterStateService.getInstance(task.instanceId)
-        if (existing != null) {
-            clusterStateService.putInstance(
-                existing.copy(
-                    state = InstanceState.ONLINE,
-                    allocatedPort = allocatedPort,
-                    processPid = processHandle.pid(),
-                    hostAddress = finalHostAddress,
-                    runtime = configuration.runtime
-                )
-            )
-        }
-
-        // Track node resources
-        val nodeId = existing?.wrapperNodeId ?: task.instanceId
-        clusterStateService.addNodeResources(nodeId, configuration.ramMB, configuration.cpu)
-
-        // Write state file for recovery after node restart
-        writeStateFile(workingDir, existing?.copy(
-            hostAddress = resolvedHostAddress,
-            runtime = configuration.runtime
-        ) ?: InstanceInfo(
-            id = task.instanceId,
-            configurationName = configuration.name,
-            wrapperNodeId = nodeId,
-            hostAddress = resolvedHostAddress,
-            allocatedPort = allocatedPort,
-            state = InstanceState.ONLINE,
-            lastHeartbeat = System.currentTimeMillis(),
-            processPid = processHandle.pid(),
-            allocatedRamMB = configuration.ramMB,
-            allocatedCpu = configuration.cpu,
-            runtime = configuration.runtime
-        ))
-
-        log("Instance ${task.instanceId} deployed with PID ${processHandle.pid()}", LogLevel.SUCCESS)
+    private fun failQueuedDeployment(task: DeployInstanceTask, reason: String) {
+        clusterStateService.removeInstance(task.instanceId)
+        log("$reason; removed queued instance", LogLevel.ERROR)
     }
 
     private fun handleStop(task: StopInstanceTask) {
@@ -234,20 +217,28 @@ class TaskRouter @Inject constructor(
     ) {
         if (configuration?.static != true) {
             val workingDir = Paths.get("./running/${instance.id}").toAbsolutePath().normalize()
-            deleteStateFile(workingDir)
-            try {
-                if (Files.exists(workingDir)) {
-                    Files.walk(workingDir)
-                        .sorted(Comparator.reverseOrder())
-                        .forEach { Files.deleteIfExists(it) }
-                    log("Cleaned up working directory for instance ${instance.id}")
-                }
-            } catch (cleanupEx: Exception) {
-                log("Failed to clean up working directory for instance ${instance.id}: ${cleanupEx.message}", LogLevel.WARNING)
-            }
+            cleanupWorkingDirectory(instance.id, workingDir)
         }
 
         clusterStateService.removeNodeResources(instance.wrapperNodeId, instance.allocatedRamMB, instance.allocatedCpu)
+    }
+
+    private fun cleanupWorkingDirectory(instanceId: String, workingDir: Path) {
+        deleteStateFile(workingDir)
+        try {
+            if (Files.exists(workingDir)) {
+                Files.walk(workingDir).use { paths ->
+                    paths.sorted(Comparator.reverseOrder())
+                        .forEach { Files.deleteIfExists(it) }
+                }
+                log("Cleaned up working directory for instance $instanceId")
+            }
+        } catch (cleanupFailure: Exception) {
+            log(
+                "Failed to clean up working directory for instance $instanceId: ${cleanupFailure.message}",
+                LogLevel.WARNING
+            )
+        }
     }
 
     private fun handleExecute(task: ExecuteCommandTask) {

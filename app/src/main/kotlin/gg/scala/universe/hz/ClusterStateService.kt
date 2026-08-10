@@ -3,6 +3,7 @@ package gg.scala.universe.hz
 import com.google.inject.Inject
 import com.hazelcast.core.HazelcastInstance
 import com.hazelcast.map.IMap
+import com.hazelcast.map.EntryProcessor
 import gg.scala.universe.schema.Configuration
 import gg.scala.universe.schema.InstanceInfo
 import gg.scala.universe.schema.InstanceState
@@ -75,27 +76,55 @@ class ClusterStateService @Inject constructor(
         )
     }
 
+    fun updateInstanceFromPlugin(
+        id: String,
+        state: InstanceState,
+        lastHeartbeat: Long
+    ): InstanceInfo? {
+        instances.lock(id)
+        return try {
+            val existing = instances[id] ?: return null
+            if (existing.state == InstanceState.STOPPING) {
+                existing
+            } else {
+                existing.copy(state = state, lastHeartbeat = lastHeartbeat).also {
+                    instances[id] = it
+                }
+            }
+        } finally {
+            instances.unlock(id)
+        }
+    }
+
     fun getNodeResources(nodeId: String): NodeResources {
         return nodeResources[nodeId] ?: NodeResources(0, 0)
     }
 
     fun addNodeResources(nodeId: String, ramMB: Int, cpu: Int) {
-        val current = getNodeResources(nodeId)
-        nodeResources[nodeId] = NodeResources(
-            usedRamMB = current.usedRamMB + ramMB,
-            usedCpu = current.usedCpu + cpu
-        )
+        nodeResources.executeOnKey(nodeId, AdjustNodeResourcesProcessor(ramMB, cpu))
     }
 
     fun removeNodeResources(nodeId: String, ramMB: Int, cpu: Int) {
-        val current = getNodeResources(nodeId)
-        nodeResources[nodeId] = NodeResources(
-            usedRamMB = maxOf(0, current.usedRamMB - ramMB),
-            usedCpu = maxOf(0, current.usedCpu - cpu)
-        )
+        nodeResources.executeOnKey(nodeId, AdjustNodeResourcesProcessor(-ramMB, -cpu))
     }
 
     fun clearNodeResources(nodeId: String) {
         nodeResources.remove(nodeId)
+    }
+
+    private data class AdjustNodeResourcesProcessor(
+        val ramDelta: Int,
+        val cpuDelta: Int
+    ) : EntryProcessor<String, NodeResources, Unit> {
+        override fun process(entry: MutableMap.MutableEntry<String, NodeResources>) {
+            @Suppress("USELESS_ELVIS")
+            val current = entry.value ?: NodeResources()
+            entry.setValue(
+                NodeResources(
+                    usedRamMB = maxOf(0, current.usedRamMB + ramDelta),
+                    usedCpu = maxOf(0, current.usedCpu + cpuDelta)
+                )
+            )
+        }
     }
 }

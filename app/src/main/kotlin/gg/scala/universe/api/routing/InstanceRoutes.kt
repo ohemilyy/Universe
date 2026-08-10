@@ -15,8 +15,11 @@ import gg.scala.universe.service.InstanceCreationService
 import gg.scala.universe.service.InstanceLifecyclePolicy
 import gg.scala.universe.service.LifecycleRequestDecision
 import gg.scala.universe.service.LifecycleTarget
+import gg.scala.universe.service.StopDispatchOutcome
+import gg.scala.universe.service.toRequestOutcome
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.call
 import io.ktor.server.auth.authenticate
 import io.ktor.server.request.receive
@@ -156,9 +159,6 @@ fun Application.configureInstanceRoutes(
                         ?: return@put call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing instance ID"))
 
                     val request = call.receive<UpdateStateRequest>()
-                    val instance = clusterStateService.getInstance(id)
-                        ?: return@put call.respond(HttpStatusCode.NotFound, mapOf("error" to "Instance not found"))
-
                     val newState = try {
                         InstanceState.valueOf(request.state)
                     } catch (e: IllegalArgumentException) {
@@ -172,11 +172,14 @@ fun Application.configureInstanceRoutes(
                         )
                     }
 
-                    val updated = instance.withPluginStateReport(
+                    val updated = clusterStateService.updateInstanceFromPlugin(
+                        id = id,
                         state = newState,
                         lastHeartbeat = request.lastHeartbeat ?: System.currentTimeMillis()
+                    ) ?: return@put call.respond(
+                        HttpStatusCode.NotFound,
+                        mapOf("error" to "Instance not found")
                     )
-                    clusterStateService.putInstance(updated)
 
                     call.respond(HttpStatusCode.OK, updated.toExternalApiView())
                 }
@@ -196,9 +199,9 @@ fun Application.configureInstanceRoutes(
                         it.uuid.toString() == instance.wrapperNodeId
                     } ?: hazelcastInstance.cluster.localMember
 
-                    taskDispatcher.dispatchStop(id, member)
-
-                    call.respond(HttpStatusCode.Accepted, mapOf("message" to "Instance $id is stopping"))
+                    val outcome = taskDispatcher.dispatchStop(id, member)
+                        .toRequestOutcome(restart = false)
+                    call.respondStopDispatch(id, restart = false, outcome)
                 }
 
                 patch("/{id}/lifecycle") {
@@ -250,12 +253,14 @@ fun Application.configureInstanceRoutes(
                             call.respond(HttpStatusCode.OK, mapOf("message" to "Instance started", "instance" to newInstance.toExternalApiView()))
                         }
                         LifecycleTarget.STOP -> {
-                            taskDispatcher.dispatchStop(id, member)
-                            call.respond(HttpStatusCode.Accepted, mapOf("message" to "Instance $id is stopping"))
+                            val outcome = taskDispatcher.dispatchStop(id, member)
+                                .toRequestOutcome(restart = false)
+                            call.respondStopDispatch(id, restart = false, outcome)
                         }
                         LifecycleTarget.RESTART -> {
-                            taskDispatcher.dispatchStop(id, member, restart = true)
-                            call.respond(HttpStatusCode.Accepted, mapOf("message" to "Instance $id restart queued"))
+                            val outcome = taskDispatcher.dispatchStop(id, member, restart = true)
+                                .toRequestOutcome(restart = true)
+                            call.respondStopDispatch(id, restart = true, outcome)
                         }
                     }
                 }
@@ -280,12 +285,34 @@ fun Application.configureInstanceRoutes(
     }
 }
 
+private suspend fun ApplicationCall.respondStopDispatch(
+    instanceId: String,
+    restart: Boolean,
+    outcome: StopDispatchOutcome
+) {
+    when (outcome) {
+        StopDispatchOutcome.ACCEPTED -> respond(
+            HttpStatusCode.Accepted,
+            mapOf("message" to if (restart) "Instance $instanceId restart queued" else "Instance $instanceId is stopping")
+        )
+        StopDispatchOutcome.IDEMPOTENT -> respond(
+            HttpStatusCode.Accepted,
+            mapOf("message" to "Instance $instanceId is already stopping")
+        )
+        StopDispatchOutcome.CONFLICT -> respond(
+            HttpStatusCode.Conflict,
+            mapOf("error" to "Instance $instanceId is already stopping; restart was not queued")
+        )
+        StopDispatchOutcome.NOT_FOUND -> respond(
+            HttpStatusCode.NotFound,
+            mapOf("error" to "Instance not found")
+        )
+    }
+}
+
 data class CreateInstanceRequest(val configurationName: String)
 data class UpdateStateRequest(val state: String, val lastHeartbeat: Long? = null)
 data class ExecuteOnInstanceRequest(val command: String)
 
 internal fun InstanceInfo.toExternalApiView(): InstanceInfo =
     if (state == InstanceState.STOPPING) copy(state = InstanceState.ONLINE) else this
-
-internal fun InstanceInfo.withPluginStateReport(state: InstanceState, lastHeartbeat: Long): InstanceInfo =
-    if (this.state == InstanceState.STOPPING) this else copy(state = state, lastHeartbeat = lastHeartbeat)
