@@ -35,9 +35,9 @@ class InstanceCreationService @Inject constructor(
      */
     override fun createInstance(configuration: Configuration, instanceId: String?): InstanceInfo? {
         val id = instanceId ?: InstanceIdGenerator.generate()
-
-        val wrapperMember = findBestNode(configuration)
-        if (wrapperMember == null) {
+        val generation = 1L
+        val candidates = eligibleNodes(configuration)
+        if (candidates.isEmpty()) {
             log(
                 "No node has enough resources (RAM=${configuration.ramMB}MB, CPU=${configuration.cpu}) " +
                 "for instance '$id'.",
@@ -45,28 +45,38 @@ class InstanceCreationService @Inject constructor(
             )
             return null
         }
-
-        val instanceInfo = InstanceInfo(
-            id = id,
-            configurationName = configuration.name,
-            wrapperNodeId = wrapperMember.uuid.toString(),
-            hostAddress = configuration.hostAddress,
-            allocatedPort = 0,
-            state = InstanceState.CREATING,
-            lastHeartbeat = System.currentTimeMillis(),
-            processPid = null,
-            allocatedRamMB = configuration.ramMB,
-            allocatedCpu = configuration.cpu,
-            runtime = configuration.runtime
-        )
-
-        if (!clusterStateService.putInstance(instanceInfo)) {
-            log("Instance '$id' is already owned by reconciliation cleanup", LogLevel.WARNING)
-            return null
+        for (wrapperMember in candidates) {
+            val instanceInfo = InstanceInfo(
+                id = id,
+                configurationName = configuration.name,
+                wrapperNodeId = wrapperMember.uuid.toString(),
+                hostAddress = configuration.hostAddress,
+                allocatedPort = 0,
+                state = InstanceState.CREATING,
+                lastHeartbeat = System.currentTimeMillis(),
+                processPid = null,
+                allocatedRamMB = configuration.ramMB,
+                allocatedCpu = configuration.cpu,
+                runtime = configuration.runtime
+            )
+            val maxRam = wrapperMember.getAttribute("maxRamMB")?.toIntOrNull() ?: Int.MAX_VALUE
+            val maxCpu = wrapperMember.getAttribute("maxCpu")?.toIntOrNull() ?: Int.MAX_VALUE
+            if (!clusterStateService.reserveCreatingInstance(instanceInfo, generation, maxRam, maxCpu)) {
+                continue
+            }
+            try {
+                taskDispatcher.dispatchDeploy(instanceInfo, wrapperMember)
+                return instanceInfo
+            } catch (failure: RuntimeException) {
+                clusterStateService.cancelCreatingInstance(instanceInfo, generation)
+                log(
+                    "Failed to dispatch instance '$id' to ${wrapperMember.uuid}: ${failure.message}",
+                    LogLevel.WARNING
+                )
+            }
         }
-        taskDispatcher.dispatchDeploy(instanceInfo, wrapperMember)
-
-        return instanceInfo
+        log("No node could atomically reserve resources for instance '$id'.", LogLevel.WARNING)
+        return null
     }
 
     /**
@@ -74,6 +84,10 @@ class InstanceCreationService @Inject constructor(
      * Returns null if no node has enough resources.
      */
     fun findBestNode(configuration: Configuration): Member? {
+        return eligibleNodes(configuration).firstOrNull()
+    }
+
+    private fun eligibleNodes(configuration: Configuration): List<Member> {
         val allowedNodes = configuration.nodes
 
         val candidates = hazelcastInstance.cluster.members.filter { member ->
@@ -92,12 +106,9 @@ class InstanceCreationService @Inject constructor(
             resources.usedCpu + configuration.cpu <= maxCpu
         }
 
-        if (candidates.isEmpty()) {
-            return null
-        }
-
-        // Pick the node with the most available RAM
-        return candidates.maxByOrNull { member ->
+        // Try nodes with the most available RAM first. The actual capacity
+        // decision is repeated atomically by reserveCreatingInstance.
+        return candidates.sortedByDescending { member ->
             val resources = clusterStateService.getNodeResources(member.uuid.toString())
             val maxRam = member.getAttribute("maxRamMB")?.toIntOrNull() ?: Int.MAX_VALUE
             maxRam - resources.usedRamMB

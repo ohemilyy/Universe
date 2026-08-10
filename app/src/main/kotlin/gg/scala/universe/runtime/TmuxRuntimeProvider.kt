@@ -30,7 +30,7 @@ class TmuxRuntimeProvider : RuntimeProvider {
         val sessionName = sessionName(instanceId)
 
         // Ensure any stale session with this name is cleaned up first
-        silentExec("tmux", "kill-session", "-t", sessionName)
+        runCommand("tmux", "kill-session", "-t", sessionName)
 
         // Build command with resource limit fallback prefix
         val wrappedCommand = CgroupResourceEnforcer.buildFallbackPrefix(ramMB, cpu) + command
@@ -59,7 +59,8 @@ class TmuxRuntimeProvider : RuntimeProvider {
 
     override fun stop(instanceId: String) {
         val sessionName = sessionName(instanceId)
-        silentExec("tmux", "kill-session", "-t", sessionName)
+        runCommand("tmux", "kill-session", "-t", sessionName)
+        check(!hasSession(sessionName)) { "Tmux session '$sessionName' is still running" }
         sessions.remove(instanceId)
         CgroupResourceEnforcer.cleanupCgroup(instanceId)
         log("Stopped tmux session '$sessionName' for instance $instanceId")
@@ -75,15 +76,7 @@ class TmuxRuntimeProvider : RuntimeProvider {
     }
 
     override fun isRunning(instanceId: String): Boolean {
-        val sessionName = sessionName(instanceId)
-        return try {
-            ProcessBuilder("tmux", "has-session", "-t", sessionName)
-                .inheritIO()
-                .start()
-                .waitFor() == 0
-        } catch (_: Exception) {
-            false
-        }
+        return hasSession(sessionName(instanceId))
     }
 
     override fun listRunningInstances(): List<String> {
@@ -117,11 +110,26 @@ class TmuxRuntimeProvider : RuntimeProvider {
 
     private fun sessionName(instanceId: String): String = "universe-$instanceId"
 
-    private fun silentExec(vararg command: String) {
-        try {
-            ProcessBuilder(*command).inheritIO().start().waitFor()
-        } catch (_: Exception) {
-            // ignored — session may not exist
+    private fun runCommand(vararg command: String): Int {
+        return ProcessBuilder(*command)
+            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+            .redirectError(ProcessBuilder.Redirect.DISCARD)
+            .start()
+            .waitFor()
+    }
+
+    private fun hasSession(sessionName: String): Boolean {
+        val process = ProcessBuilder("tmux", "has-session", "-t", sessionName)
+            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+            .redirectError(ProcessBuilder.Redirect.PIPE)
+            .start()
+        val error = process.errorStream.bufferedReader().readText()
+        val exitCode = process.waitFor()
+        return when {
+            exitCode == 0 -> true
+            error.contains("no server running", ignoreCase = true) ||
+                error.contains("can't find session", ignoreCase = true) -> false
+            else -> error("Unable to confirm tmux session '$sessionName' state: ${error.trim()}")
         }
     }
 }

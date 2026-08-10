@@ -6,11 +6,11 @@ import com.hazelcast.core.HazelcastInstance
 import gg.scala.universe.console.LogLevel
 import gg.scala.universe.console.log
 import gg.scala.universe.hz.ClusterStateService
+import gg.scala.universe.hz.task.InstanceWorkspace
 import gg.scala.universe.runtime.PortAllocator
 import gg.scala.universe.runtime.RuntimeRegistry
 import gg.scala.universe.schema.InstanceState
 import java.nio.file.Files
-import java.nio.file.Paths
 import java.util.Comparator
 import java.util.concurrent.CompletableFuture
 
@@ -25,7 +25,8 @@ class NodeShutdownService @Inject constructor(
     private val clusterStateService: ClusterStateService,
     private val hazelcastInstance: HazelcastInstance,
     private val runtimeRegistry: RuntimeRegistry,
-    private val portAllocator: PortAllocator
+    private val portAllocator: PortAllocator,
+    private val workspace: InstanceWorkspace = InstanceWorkspace()
 ) {
 
     /**
@@ -46,6 +47,11 @@ class NodeShutdownService @Inject constructor(
         val localInstances = try {
             clusterStateService.getAllInstances()
                 .filter { it.wrapperNodeId == localNodeId }
+                .filter {
+                    it.state == InstanceState.CREATING ||
+                        it.state == InstanceState.ONLINE ||
+                        it.state == InstanceState.STOPPING
+                }
         } catch (_: com.hazelcast.core.HazelcastInstanceNotActiveException) {
             log("Hazelcast already shut down, skipping local instance cleanup")
             return
@@ -68,16 +74,31 @@ class NodeShutdownService @Inject constructor(
                 // Use the runtime stored at instance creation time so config reloads
                 // don't cause us to stop instances with the wrong provider.
                 val runtimeKey = instance.runtime
+                val generation = clusterStateService.getLifecycleGeneration(instance.id)
+                if (!clusterStateService.isCurrentLifecycle(
+                        instance, generation, instance.state
+                    )
+                ) return@runAsync
                 val runtimeProvider = runtimeRegistry.get(runtimeKey)
-                    ?: runtimeRegistry.getAll().values.firstOrNull()
 
-                if (runtimeProvider != null) {
-                    try {
-                        runtimeProvider.stop(instance.id)
-                        log("Stopped instance ${instance.id} (runtime=$runtimeKey)")
-                    } catch (e: Exception) {
-                        log("Failed to stop instance ${instance.id}: ${e.message}", LogLevel.WARNING)
-                    }
+                if (runtimeProvider == null) {
+                    log("No runtime available to stop instance ${instance.id}", LogLevel.WARNING)
+                    return@runAsync
+                }
+                try {
+                    if (!clusterStateService.isCurrentLifecycle(
+                            instance, generation, instance.state
+                        )
+                    ) return@runAsync
+                    runtimeProvider.stop(instance.id)
+                    log("Stopped instance ${instance.id} (runtime=$runtimeKey)")
+                } catch (e: Exception) {
+                    log(
+                        "Failed to confirm teardown for instance ${instance.id}: ${e.message}; " +
+                            "retaining lifecycle ownership",
+                        LogLevel.WARNING
+                    )
+                    return@runAsync
                 }
 
                 // Release port
@@ -85,12 +106,13 @@ class NodeShutdownService @Inject constructor(
 
                 // Clean up working directory for non-static instances
                 if (config?.static != true) {
-                    val workingDir = Paths.get("./running/${instance.id}").toAbsolutePath().normalize()
+                    val workingDir = workspace.dynamicInstance(instance.id)
                     try {
                         if (Files.exists(workingDir)) {
-                            Files.walk(workingDir)
-                                .sorted(Comparator.reverseOrder())
-                                .forEach { Files.deleteIfExists(it) }
+                            Files.walk(workingDir).use { paths ->
+                                paths.sorted(Comparator.reverseOrder())
+                                    .forEach { Files.deleteIfExists(it) }
+                            }
                             log("Cleaned up working directory for instance ${instance.id}")
                         }
                     } catch (cleanupEx: Exception) {
@@ -101,6 +123,7 @@ class NodeShutdownService @Inject constructor(
                 try {
                     clusterStateService.completeInstanceTermination(
                         expectedInstance = instance,
+                        expectedGeneration = generation,
                         finalState = InstanceState.STOPPED
                     )
                 } catch (_: com.hazelcast.core.HazelcastInstanceNotActiveException) {

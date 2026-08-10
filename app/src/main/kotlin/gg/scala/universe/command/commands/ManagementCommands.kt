@@ -548,6 +548,9 @@ private fun CommandSource.sendStopDispatchMessage(
         StopDispatchOutcome.CONFLICT -> sendMessage(
             "Instance $instanceId is already stopping; restart was not queued."
         )
+        StopDispatchOutcome.SERVICE_UNAVAILABLE -> sendMessage(
+            "Wrapper unavailable or lifecycle task submission failed for instance '$instanceId'."
+        )
         StopDispatchOutcome.NOT_FOUND -> sendMessage("Instance '$instanceId' was no longer found; nothing was queued.")
     }
 }

@@ -5,6 +5,8 @@ import gg.scala.universe.console.LogLevel
 import gg.scala.universe.console.log
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 /**
  * [RuntimeProvider] that runs the instance command directly as a subprocess.
@@ -63,9 +65,41 @@ class ProcessRuntimeProvider : RuntimeProvider {
     }
 
     override fun stop(instanceId: String) {
-        val process = processes.remove(instanceId) ?: return
+        val process = processes[instanceId] ?: return
         process.destroy()
+        try {
+            process.onExit().get(STOP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        } catch (failure: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw IllegalStateException(
+                "Interrupted while confirming process teardown for instance $instanceId",
+                failure
+            )
+        } catch (_: TimeoutException) {
+            process.destroyForcibly()
+            try {
+                process.onExit().get(STOP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            } catch (failure: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IllegalStateException(
+                    "Interrupted while confirming forced process teardown for instance $instanceId",
+                    failure
+                )
+            } catch (failure: Exception) {
+                throw IllegalStateException(
+                    "Failed to confirm process teardown for instance $instanceId",
+                    failure
+                )
+            }
+        } catch (failure: Exception) {
+            throw IllegalStateException(
+                "Failed to confirm process teardown for instance $instanceId",
+                failure
+            )
+        }
+        check(!process.isAlive) { "Process for instance $instanceId is still running" }
         CgroupResourceEnforcer.cleanupCgroup(instanceId)
+        processes.remove(instanceId, process)
         log("Stopped process for instance $instanceId")
     }
 
@@ -102,5 +136,9 @@ class ProcessRuntimeProvider : RuntimeProvider {
             java.nio.file.Files.exists(stderr) -> stderr.toFile().readLines().takeLast(lines)
             else -> emptyList()
         }
+    }
+
+    private companion object {
+        const val STOP_TIMEOUT_SECONDS = 10L
     }
 }

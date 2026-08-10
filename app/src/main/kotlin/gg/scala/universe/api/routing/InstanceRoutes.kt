@@ -248,7 +248,27 @@ fun Application.configureInstanceRoutes(
                         LifecycleTarget.START -> {
                             val config = clusterStateService.getConfiguration(instance.configurationName)
                                 ?: return@patch call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Configuration not found"))
-                            val newInstance = instanceCreationService.createInstance(config)
+                            val instances = clusterStateService.instances
+                            val newInstance = run {
+                                instances.lock(id)
+                                try {
+                                    val current = instances[id]
+                                    if (current != instance || current.state == InstanceState.STOPPING) {
+                                        null
+                                    } else {
+                                        instanceCreationService.createInstance(config)
+                                    }
+                                } finally {
+                                    instances.unlock(id)
+                                }
+                            }
+                            if (clusterStateService.getInstance(id)?.state == InstanceState.STOPPING && newInstance == null) {
+                                return@patch call.respond(
+                                    HttpStatusCode.Conflict,
+                                    mapOf("error" to "Instance $id is stopping and cannot be started")
+                                )
+                            }
+                            newInstance
                                 ?: return@patch call.respond(HttpStatusCode.ServiceUnavailable, mapOf("error" to "No node has enough resources"))
                             call.respond(HttpStatusCode.OK, mapOf("message" to "Instance started", "instance" to newInstance.toExternalApiView()))
                         }
@@ -302,6 +322,10 @@ private suspend fun ApplicationCall.respondStopDispatch(
         StopDispatchOutcome.CONFLICT -> respond(
             HttpStatusCode.Conflict,
             mapOf("error" to "Instance $instanceId is already stopping; restart was not queued")
+        )
+        StopDispatchOutcome.SERVICE_UNAVAILABLE -> respond(
+            HttpStatusCode.ServiceUnavailable,
+            mapOf("error" to "Wrapper unavailable or lifecycle task submission failed for instance $instanceId")
         )
         StopDispatchOutcome.NOT_FOUND -> respond(
             HttpStatusCode.NotFound,

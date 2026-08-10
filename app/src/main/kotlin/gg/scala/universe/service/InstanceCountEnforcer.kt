@@ -166,7 +166,10 @@ class InstanceCountEnforcer @Inject constructor(
                 instance.state == InstanceState.CREATING &&
                 isStale(instance.lastHeartbeat, now, CREATING_TIMEOUT_MS)
             ) {
-                instances.remove(instanceId)
+                clusterStateService.cancelCreatingInstance(
+                    instance,
+                    clusterStateService.getLifecycleGeneration(instanceId)
+                )
             }
         } finally {
             instances.unlock(instanceId)

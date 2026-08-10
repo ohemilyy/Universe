@@ -32,6 +32,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.stream.Stream
+import org.junit.jupiter.api.io.TempDir
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -41,6 +42,8 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class TaskRouterLifecycleTest {
+    @TempDir
+    lateinit var tempDir: Path
     private lateinit var hazelcastInstance: HazelcastInstance
     private lateinit var state: ClusterStateService
     private lateinit var portAllocator: PortAllocator
@@ -72,7 +75,8 @@ class TaskRouterLifecycleTest {
             portAllocator,
             TemplateManager(variableRegistry, TemplateStorageRegistryImpl()),
             variableRegistry,
-            hazelcastInstance
+            hazelcastInstance,
+            InstanceWorkspace(tempDir)
         )
 
         singlePort = ServerSocket(0).use { it.localPort }
@@ -91,15 +95,14 @@ class TaskRouterLifecycleTest {
     @AfterTest
     fun tearDown() {
         hazelcastInstance.shutdown()
-        deleteRecursively(Path.of("./static/${configuration.name}"))
     }
 
     @Test
     fun `port allocation failure removes creating record`() {
         portAllocator.reserve(singlePort)
-        state.putInstance(creatingInstance("new001", allocatedPort = 0))
+        queueCreating("new001")
 
-        router.route(DeployInstanceTask("new001", configuration.name))
+        router.route(DeployInstanceTask("new001", configuration.name, expectedGeneration = 1))
 
         assertNull(state.getInstance("new001"))
     }
@@ -108,9 +111,9 @@ class TaskRouterLifecycleTest {
     fun `missing runtime removes creating record`() {
         configuration = configuration.copy(runtime = "missing")
         state.putConfiguration(configuration)
-        state.putInstance(creatingInstance("new001", allocatedPort = 0))
+        queueCreating("new001")
 
-        router.route(DeployInstanceTask("new001", configuration.name))
+        router.route(DeployInstanceTask("new001", configuration.name, expectedGeneration = 1))
 
         assertNull(state.getInstance("new001"))
     }
@@ -119,24 +122,24 @@ class TaskRouterLifecycleTest {
     fun `post start host lookup failure cleans runtime port and working directory`() {
         configuration = configuration.copy(static = false)
         state.putConfiguration(configuration)
-        state.putInstance(creatingInstance("new001", allocatedPort = 0))
+        queueCreating("new001")
         runtime.failHostLookup = true
 
         val routingFailure = runCatching {
-            router.route(DeployInstanceTask("new001", configuration.name))
+            router.route(DeployInstanceTask("new001", configuration.name, expectedGeneration = 1))
         }.exceptionOrNull()
 
         assertNull(routingFailure)
         assertNull(state.getInstance("new001"))
         assertTrue(singlePort !in portAllocator.getLocalAllocations())
         assertEquals(listOf("start:new001", "stop:new001"), runtime.operations)
-        assertTrue(Files.notExists(Path.of("./running/new001")))
+        assertTrue(Files.notExists(tempDir.resolve("running/new001")))
     }
 
     @Test
     fun `stop publishes stopped only after releasing port`() {
         portAllocator.reserve(singlePort)
-        state.putInstance(onlineInstance("old001"))
+        queueStopping("old001")
         val stoppedSawReleased = AtomicBoolean(false)
         val stoppedObserved = CountDownLatch(1)
         state.instances.addEntryListener(
@@ -149,7 +152,7 @@ class TaskRouterLifecycleTest {
             true
         )
 
-        router.route(StopInstanceTask("old001"))
+        router.route(StopInstanceTask("old001", expectedGeneration = 1))
 
         assertTrue(stoppedObserved.await(2, TimeUnit.SECONDS))
         assertTrue(stoppedSawReleased.get())
@@ -158,16 +161,16 @@ class TaskRouterLifecycleTest {
     @Test
     fun `single port restart converges after release`() {
         portAllocator.reserve(singlePort)
-        state.putInstance(onlineInstance("old001"))
+        queueStopping("old001")
 
-        router.route(StopInstanceTask("old001", restart = true))
+        router.route(StopInstanceTask("old001", restart = true, expectedGeneration = 1))
 
         val restarted = assertNotNull(state.getInstance("old001"))
         assertEquals(InstanceState.ONLINE, restarted.state)
         assertEquals(singlePort, restarted.allocatedPort)
         assertEquals(listOf("stop:old001", "start:old001"), runtime.operations)
         val saved = Serializers.GSON.fromJson(
-            Files.readString(Path.of("./static/${configuration.name}/.universe-state.json")),
+            Files.readString(tempDir.resolve("static/${configuration.name}/.universe-state.json")),
             InstanceInfo::class.java
         )
         assertEquals(restarted, saved)
@@ -176,12 +179,112 @@ class TaskRouterLifecycleTest {
     @Test
     fun `forced stop skips graceful runtime probing`() {
         portAllocator.reserve(singlePort)
-        state.putInstance(onlineInstance("old001"))
+        queueStopping("old001")
 
-        router.route(StopInstanceTask("old001", force = true))
+        router.route(StopInstanceTask("old001", force = true, expectedGeneration = 1))
 
         assertEquals(0, runtime.isRunningChecks)
         assertEquals(listOf("stop:old001"), runtime.operations)
+    }
+
+    @Test
+    fun `stale deploy generation cannot start after stopping wins`() {
+        val creating = creatingInstance("new001", allocatedPort = 0)
+        assertTrue(
+            state.reserveCreatingInstance(
+                creating,
+                generation = 7,
+                maxRamMB = 1024,
+                maxCpu = 100
+            )
+        )
+        state.updateInstanceState("new001", InstanceState.STOPPING, lastHeartbeat = 2)
+
+        router.route(DeployInstanceTask("new001", configuration.name, expectedGeneration = 7))
+
+        assertEquals(InstanceState.STOPPING, state.getInstance("new001")?.state)
+        assertTrue(runtime.operations.isEmpty())
+        assertTrue(singlePort !in portAllocator.getLocalAllocations())
+    }
+
+    @Test
+    fun `delayed stop token cannot tear down newer incarnation`() {
+        val creating = creatingInstance("old001", allocatedPort = singlePort)
+        assertTrue(state.reserveCreatingInstance(creating, 8, maxRamMB = 1024, maxCpu = 100))
+        state.updateInstanceState("old001", InstanceState.STOPPING, lastHeartbeat = 2)
+        portAllocator.reserve(singlePort)
+
+        router.route(StopInstanceTask("old001", force = true, expectedGeneration = 7))
+
+        assertEquals(InstanceState.STOPPING, state.getInstance("old001")?.state)
+        assertTrue(runtime.operations.isEmpty())
+        assertTrue(singlePort in portAllocator.getLocalAllocations())
+    }
+
+    @Test
+    fun `stopping that wins during deploy success rolls runtime back without deleting barrier`() {
+        queueCreating("new001")
+        val started = CountDownLatch(1)
+        val finishStart = CountDownLatch(1)
+        runtime.startBlocker = {
+            started.countDown()
+            finishStart.await(2, TimeUnit.SECONDS)
+        }
+        val deployment = CompletableFuture.runAsync {
+            router.route(DeployInstanceTask("new001", configuration.name, expectedGeneration = 1))
+        }
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+        state.updateInstanceState("new001", InstanceState.STOPPING, lastHeartbeat = 3)
+        finishStart.countDown()
+        deployment.get(2, TimeUnit.SECONDS)
+
+        assertEquals(InstanceState.STOPPING, state.getInstance("new001")?.state)
+        assertEquals(listOf("start:new001", "stop:new001"), runtime.operations)
+        assertTrue(singlePort !in portAllocator.getLocalAllocations())
+        assertEquals(configuration.ramMB, state.getNodeResources(creatingInstance("x", 0).wrapperNodeId).usedRamMB)
+    }
+
+    @Test
+    fun `stopping that wins during deploy failure preserves barrier and owned reservation`() {
+        queueCreating("new001")
+        val started = CountDownLatch(1)
+        val finishStart = CountDownLatch(1)
+        runtime.startBlocker = {
+            started.countDown()
+            finishStart.await(2, TimeUnit.SECONDS)
+        }
+        runtime.failStart = true
+        val deployment = CompletableFuture.runAsync {
+            router.route(DeployInstanceTask("new001", configuration.name, expectedGeneration = 1))
+        }
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+        state.updateInstanceState("new001", InstanceState.STOPPING, lastHeartbeat = 3)
+        finishStart.countDown()
+        deployment.get(2, TimeUnit.SECONDS)
+
+        assertEquals(InstanceState.STOPPING, state.getInstance("new001")?.state)
+        assertEquals(listOf("start:new001", "stop:new001"), runtime.operations)
+        assertTrue(singlePort !in portAllocator.getLocalAllocations())
+        assertEquals(
+            configuration.ramMB,
+            state.getNodeResources(creatingInstance("x", 0).wrapperNodeId).usedRamMB
+        )
+    }
+
+    @Test
+    fun `teardown failure retains stopping ownership port and resources`() {
+        queueStopping("old001")
+        portAllocator.reserve(singlePort)
+        runtime.failStop = true
+
+        val failure = runCatching {
+            router.route(StopInstanceTask("old001", force = true, expectedGeneration = 1))
+        }.exceptionOrNull()
+
+        assertNotNull(failure)
+        assertEquals(InstanceState.STOPPING, state.getInstance("old001")?.state)
+        assertTrue(singlePort in portAllocator.getLocalAllocations())
+        assertEquals(configuration.ramMB, state.getNodeResources(creatingInstance("x", 0).wrapperNodeId).usedRamMB)
     }
 
     @Test
@@ -191,8 +294,13 @@ class TaskRouterLifecycleTest {
             lastHeartbeat = 0
         )
         portAllocator.reserve(singlePort)
-        state.addNodeResources(instance.wrapperNodeId, ramMB = 96, cpu = 3)
-        state.putInstance(instance)
+        state.addNodeResources(instance.wrapperNodeId, ramMB = 32, cpu = 2)
+        assertTrue(
+            state.reserveCreatingInstance(
+                instance.copy(state = InstanceState.CREATING), 1, Int.MAX_VALUE, Int.MAX_VALUE
+            )
+        )
+        state.updateInstanceState(instance.id, InstanceState.STOPPING, 0)
         val stopStarted = CountDownLatch(1)
         val allowStopCompletion = CountDownLatch(1)
         runtime.stopBlocker = {
@@ -200,7 +308,9 @@ class TaskRouterLifecycleTest {
             allowStopCompletion.await(2, TimeUnit.SECONDS)
         }
         val routing = CompletableFuture.runAsync {
-            router.route(StopInstanceTask("old001", force = true, restart = true))
+            router.route(
+                StopInstanceTask("old001", force = true, restart = true, expectedGeneration = 1)
+            )
         }
         assertTrue(stopStarted.await(2, TimeUnit.SECONDS))
         try {
@@ -248,17 +358,26 @@ class TaskRouterLifecycleTest {
         processPid = RecordingRuntimeProvider.PROCESS_PID
     )
 
-    private fun deleteRecursively(path: Path) {
-        if (!Files.exists(path)) return
-        Files.walk(path).use { stream ->
-            stream.sorted(Comparator.reverseOrder()).forEach(Files::deleteIfExists)
-        }
+    private fun queueCreating(id: String): InstanceInfo {
+        val instance = creatingInstance(id, allocatedPort = 0)
+        assertTrue(state.reserveCreatingInstance(instance, 1, maxRamMB = 1024, maxCpu = 100))
+        return instance
+    }
+
+    private fun queueStopping(id: String): InstanceInfo {
+        val creating = creatingInstance(id, allocatedPort = singlePort)
+        assertTrue(state.reserveCreatingInstance(creating, 1, maxRamMB = 1024, maxCpu = 100))
+        state.updateInstanceState(id, InstanceState.STOPPING, lastHeartbeat = 2)
+        return state.getInstance(id)!!
     }
 
     private class RecordingRuntimeProvider : RuntimeProvider {
         val operations = mutableListOf<String>()
         var isRunningChecks = 0
         var failHostLookup = false
+        var failStart = false
+        var failStop = false
+        var startBlocker: (() -> Unit)? = null
         var stopBlocker: (() -> Unit)? = null
 
         override fun start(
@@ -272,12 +391,15 @@ class TaskRouterLifecycleTest {
             environmentVariables: Map<String, String>?
         ): ProcessHandle {
             operations += "start:$instanceId"
+            startBlocker?.invoke()
+            if (failStart) error("startup failed")
             return FixedProcessHandle
         }
 
         override fun stop(instanceId: String) {
             operations += "stop:$instanceId"
             stopBlocker?.invoke()
+            if (failStop) error("teardown failed")
         }
 
         override fun executeCommand(instanceId: String, command: String) = Unit

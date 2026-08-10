@@ -58,27 +58,33 @@ class PortAllocator @Inject constructor(
         }
 
         for (port in candidates) {
-            // 1. Check local in-memory allocations
-            if (allocatedPorts.contains(port)) {
+            // Claim locally before any slow cluster/OS probes. contains()+add() is not
+            // atomic and allowed concurrent callers to both return the same port.
+            if (!allocatedPorts.add(port)) {
                 log("Port $port skipped — already allocated locally", LogLevel.DEBUG)
                 continue
             }
 
-            // 2. Check cluster-wide active instances (all configurations)
-            if (port in clusterUsedPorts) {
-                log("Port $port skipped — in use by another instance in the cluster", LogLevel.DEBUG)
-                continue
-            }
+            var accepted = false
+            try {
+                // 2. Check cluster-wide active instances (all configurations)
+                if (port in clusterUsedPorts) {
+                    log("Port $port skipped — in use by another instance in the cluster", LogLevel.DEBUG)
+                    continue
+                }
 
-            // 3. OS-level availability check
-            if (!isPortAvailable(port)) {
-                log("Port $port skipped — bound by another process on this machine", LogLevel.DEBUG)
-                continue
-            }
+                // 3. OS-level availability check
+                if (!isPortAvailable(port)) {
+                    log("Port $port skipped — bound by another process on this machine", LogLevel.DEBUG)
+                    continue
+                }
 
-            allocatedPorts.add(port)
-            log("Allocated port $port (range ${range.min}-${range.max})")
-            return port
+                accepted = true
+                log("Allocated port $port (range ${range.min}-${range.max})")
+                return port
+            } finally {
+                if (!accepted) allocatedPorts.remove(port)
+            }
         }
 
         log("No available ports in range ${range.min}-${range.max}", LogLevel.ERROR)

@@ -101,6 +101,7 @@ logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "lo
 
 # fabric8 kubernetes client
 k8s-client = { module = "io.fabric8:kubernetes-client", version.ref = "k8s-client" }
+k8s-server-mock = { module = "io.fabric8:kubernetes-server-mock", version.ref = "k8s-client" }
 
 # database
 h2 = { module = "com.h2database:h2", version.ref = "h2" }

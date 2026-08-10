@@ -41,6 +41,13 @@ interface RuntimeProvider {
     /**
      * Stops the process associated with the given instance.
      *
+     * Returning normally confirms that no runtime resource for [instanceId]
+     * remains. Implementations must also treat an already-absent resource as a
+     * successful idempotent stop. If absence cannot be confirmed (including
+     * client, transport, permission, or deletion failures), this method must
+     * throw. Callers rely on that contract before releasing ports, filesystem
+     * state, resource reservations, or publishing a terminal lifecycle state.
+     *
      * @param instanceId Unique 6-character identifier for the instance.
      */
     fun stop(instanceId: String)
@@ -55,7 +62,10 @@ interface RuntimeProvider {
     fun executeCommand(instanceId: String, command: String)
 
     /**
-     * Returns true if the instance is currently running.
+     * Returns true if the instance is currently running and false only when
+     * the runtime can confirm that it is absent or not running. Discovery or
+     * transport failures must throw so callers do not release lifecycle
+     * ownership based on an unverified absence.
      *
      * @param instanceId Unique 6-character identifier for the instance.
      */

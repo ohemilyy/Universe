@@ -15,6 +15,7 @@ internal enum class StopDispatchOutcome {
     ACCEPTED,
     IDEMPOTENT,
     CONFLICT,
+    SERVICE_UNAVAILABLE,
     NOT_FOUND
 }
 
@@ -24,8 +25,8 @@ internal fun StopDispatchResult.toRequestOutcome(restart: Boolean): StopDispatch
         if (restart) StopDispatchOutcome.CONFLICT else StopDispatchOutcome.IDEMPOTENT
     }
     StopDispatchResult.STALE_TRANSITION -> StopDispatchOutcome.CONFLICT
-    StopDispatchResult.TARGET_UNAVAILABLE -> StopDispatchOutcome.NOT_FOUND
-    StopDispatchResult.SUBMISSION_FAILED -> StopDispatchOutcome.CONFLICT
+    StopDispatchResult.TARGET_UNAVAILABLE,
+    StopDispatchResult.SUBMISSION_FAILED -> StopDispatchOutcome.SERVICE_UNAVAILABLE
     StopDispatchResult.NOT_FOUND -> StopDispatchOutcome.NOT_FOUND
 }
 

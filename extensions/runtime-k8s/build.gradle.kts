@@ -7,4 +7,5 @@ dependencies {
     testRuntimeOnly(libs.junit.jupiter.engine)
     testImplementation(project(":api"))
     testImplementation(libs.k8s.client)
+    testImplementation(libs.k8s.server.mock)
 }

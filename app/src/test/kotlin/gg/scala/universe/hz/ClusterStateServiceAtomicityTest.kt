@@ -9,6 +9,7 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -67,6 +68,73 @@ class ClusterStateServiceAtomicityTest {
     }
 
     @Test
+    fun `creating persistence and capacity reservation are one atomic claim`() {
+        val start = CountDownLatch(1)
+        val accepted = AtomicInteger()
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val futures = listOf("new001", "new002").mapIndexed { index, id ->
+                executor.submit {
+                    start.await()
+                    if (
+                        state.reserveCreatingInstance(
+                            instance = instance(id, InstanceState.CREATING, lastHeartbeat = index.toLong()),
+                            generation = 1L,
+                            maxRamMB = 64,
+                            maxCpu = 1
+                        )
+                    ) {
+                        accepted.incrementAndGet()
+                    }
+                }
+            }
+            start.countDown()
+            futures.forEach { it.get(5, TimeUnit.SECONDS) }
+
+            assertEquals(1, accepted.get())
+            assertEquals(1, state.getAllInstances().size)
+            assertEquals(64, state.getNodeResources("node-1").usedRamMB)
+            assertEquals(1, state.getNodeResources("node-1").usedCpu)
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `unowned creating termination cannot release another reservation`() {
+        val owned = instance("new001", InstanceState.CREATING, lastHeartbeat = 1)
+        assertTrue(state.reserveCreatingInstance(owned, 1L, maxRamMB = 128, maxCpu = 2))
+        val unowned = instance("new002", InstanceState.CREATING, lastHeartbeat = 2)
+        state.putInstance(unowned)
+
+        assertTrue(
+            state.completeInstanceTermination(
+                expectedInstance = unowned,
+                expectedGeneration = 0L,
+                finalState = InstanceState.STOPPED
+            )
+        )
+
+        assertEquals(64, state.getNodeResources("node-1").usedRamMB)
+        assertEquals(1, state.getNodeResources("node-1").usedCpu)
+    }
+
+    @Test
+    fun `late plugin report cannot revive stopped instance or move heartbeat backward`() {
+        val online = instance("old001", InstanceState.ONLINE, lastHeartbeat = 100)
+        state.putInstance(online)
+        state.updateInstanceState("old001", InstanceState.STOPPED, lastHeartbeat = 200)
+
+        val stopped = state.updateInstanceFromPlugin("old001", InstanceState.ONLINE, 300)
+        assertEquals(InstanceState.STOPPED, stopped?.state)
+        assertEquals(200, stopped?.lastHeartbeat)
+
+        state.putInstance(online)
+        val stale = state.updateInstanceFromPlugin("old001", InstanceState.ONLINE, 99)
+        assertEquals(100, stale?.lastHeartbeat)
+    }
+
+    @Test
     fun `plugin report cannot overwrite stopping transition that wins the key lock`() {
         val instanceId = "old001"
         state.putInstance(instance(instanceId, InstanceState.ONLINE, lastHeartbeat = 1))
@@ -100,8 +168,8 @@ class ClusterStateServiceAtomicityTest {
     @Test
     fun `abandoned cleanup is idempotent and preserves unrelated resources`() {
         val instanceId = "old001"
-        state.addNodeResources("node-1", ramMB = 96, cpu = 3)
-        state.putInstance(instance(instanceId, InstanceState.STOPPING, lastHeartbeat = 0))
+        state.addNodeResources("node-1", ramMB = 32, cpu = 2)
+        putOwnedStopping(instance(instanceId, InstanceState.STOPPING, lastHeartbeat = 0))
 
         assertTrue(
             state.finalizeAbandonedStopping(
@@ -126,8 +194,8 @@ class ClusterStateServiceAtomicityTest {
     @Test
     fun `claimed abandoned cleanup survives interruption and rejects late revival`() {
         val instanceId = "old001"
-        state.addNodeResources("node-1", ramMB = 96, cpu = 3)
-        state.putInstance(instance(instanceId, InstanceState.STOPPING, lastHeartbeat = 0))
+        state.addNodeResources("node-1", ramMB = 32, cpu = 2)
+        putOwnedStopping(instance(instanceId, InstanceState.STOPPING, lastHeartbeat = 0))
 
         assertTrue(
             state.claimAbandonedStopping(
@@ -167,11 +235,11 @@ class ClusterStateServiceAtomicityTest {
 
     @Test
     fun `cleanup claims reject generic master and wrapper state publication`() {
-        state.addNodeResources("node-1", ramMB = 160, cpu = 4)
+        state.addNodeResources("node-1", ramMB = 32, cpu = 2)
         val first = instance("old001", InstanceState.STOPPING, lastHeartbeat = 0)
         val second = instance("old002", InstanceState.STOPPING, lastHeartbeat = 0)
-        state.putInstance(first)
-        state.putInstance(second)
+        putOwnedStopping(first)
+        putOwnedStopping(second)
         assertTrue(state.claimAbandonedStopping("old001", 0, 120_001))
         assertTrue(state.claimAbandonedStopping("old002", 0, 120_001))
 
@@ -222,8 +290,8 @@ class ClusterStateServiceAtomicityTest {
             )
         )
 
-        assertEquals(32, state.getNodeResources("node-1").usedRamMB)
-        assertEquals(2, state.getNodeResources("node-1").usedCpu)
+        assertEquals(96, state.getNodeResources("node-1").usedRamMB)
+        assertEquals(3, state.getNodeResources("node-1").usedCpu)
         assertEquals(2, state.getInstance("old001")?.lastHeartbeat)
         assertEquals(InstanceState.OFFLINE, state.getInstance("old002")?.state)
     }
@@ -241,4 +309,10 @@ class ClusterStateServiceAtomicityTest {
         allocatedCpu = 1,
         runtime = "fake"
     )
+
+    private fun putOwnedStopping(instance: InstanceInfo) {
+        val creating = instance.copy(state = InstanceState.CREATING)
+        assertTrue(state.reserveCreatingInstance(creating, 1, Int.MAX_VALUE, Int.MAX_VALUE))
+        state.updateInstanceState(instance.id, InstanceState.STOPPING, instance.lastHeartbeat)
+    }
 }

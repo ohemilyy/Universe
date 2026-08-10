@@ -15,6 +15,7 @@ import gg.scala.universe.hz.ResilienceMembershipListener
 import gg.scala.universe.hz.task.TaskDispatcher
 import gg.scala.universe.hz.task.TaskRouter
 import gg.scala.universe.hz.task.StopTaskSubmissionGateway
+import gg.scala.universe.hz.task.InstanceWorkspace
 import gg.scala.universe.runtime.PortAllocator
 import gg.scala.universe.runtime.RuntimeProvider
 import gg.scala.universe.runtime.RuntimeRegistryImpl
@@ -29,11 +30,9 @@ import gg.scala.universe.template.TemplateStorageRegistryImpl
 import gg.scala.universe.template.TemplateVariableRegistryImpl
 import java.lang.reflect.Proxy
 import java.net.ServerSocket
-import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
 import java.time.Instant
-import java.util.Comparator
 import java.util.Optional
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
@@ -48,13 +47,15 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import org.junit.jupiter.api.io.TempDir
 
 class InstanceCountEnforcerTest {
+    @TempDir
+    lateinit var tempDir: Path
     private lateinit var hazelcastInstance: HazelcastInstance
     private lateinit var state: ClusterStateService
     private lateinit var configuration: Configuration
     private lateinit var stopDispatcher: RecordingStopDispatcher
-    private val testOwnedStaticPaths = mutableSetOf<Path>()
 
     @BeforeTest
     fun setUp() {
@@ -79,7 +80,6 @@ class InstanceCountEnforcerTest {
     @AfterTest
     fun tearDown() {
         hazelcastInstance.shutdown()
-        testOwnedStaticPaths.forEach(::deleteRecursively)
     }
 
     @Test
@@ -123,8 +123,7 @@ class InstanceCountEnforcerTest {
             },
             true
         )
-        state.addNodeResources("departed", configuration.ramMB, configuration.cpu)
-        state.putInstance(
+        putOwnedInstance(
             instance(
                 id = "old001",
                 state = InstanceState.STOPPING,
@@ -148,8 +147,7 @@ class InstanceCountEnforcerTest {
     @Test
     fun `member removal preserves stopping until enforcement reaps it`() {
         val departedId = UUID.randomUUID()
-        state.addNodeResources(departedId.toString(), configuration.ramMB, configuration.cpu)
-        state.putInstance(
+        putOwnedInstance(
             instance(
                 id = "old001",
                 state = InstanceState.STOPPING,
@@ -180,8 +178,8 @@ class InstanceCountEnforcerTest {
 
     @Test
     fun `pending abandoned cleanup is reaped before replacement planning`() {
-        state.addNodeResources("departed", configuration.ramMB + 32, configuration.cpu + 2)
-        state.putInstance(
+        state.addNodeResources("departed", 32, 2)
+        putOwnedInstance(
             instance("old001", InstanceState.STOPPING, "departed", lastHeartbeat = 0)
         )
         assertTrue(
@@ -420,15 +418,11 @@ class InstanceCountEnforcerTest {
     @Test
     fun `target unavailable overrides stale membership but preserves newer transition`() {
         val wrapperId = localMemberId()
-        state.addNodeResources(
-            wrapperId,
-            ramMB = configuration.ramMB * 2 + 32,
-            cpu = configuration.cpu * 2 + 2
-        )
-        state.putInstance(
+        state.addNodeResources(wrapperId, ramMB = 32, cpu = 2)
+        putOwnedInstance(
             instance("old001", InstanceState.STOPPING, wrapperId, lastHeartbeat = 0)
         )
-        state.putInstance(
+        putOwnedInstance(
             instance("old002", InstanceState.STOPPING, wrapperId, lastHeartbeat = 0)
         )
         val dispatcher = TaskDispatcher(
@@ -492,6 +486,41 @@ class InstanceCountEnforcerTest {
     }
 
     @Test
+    fun `stop generation transfer preserves reservation ownership through completion`() {
+        val wrapperId = localMemberId()
+        val creating = instance("old001", InstanceState.CREATING, wrapperId, lastHeartbeat = 1)
+        assertTrue(state.reserveCreatingInstance(creating, 1, Int.MAX_VALUE, Int.MAX_VALUE))
+        state.updateInstanceState(creating.id, InstanceState.ONLINE, 2)
+        val dispatcher = TaskDispatcher(
+            hazelcastInstance,
+            state,
+            StopTaskSubmissionGateway { _, _ -> CompletableFuture.completedFuture("accepted") }
+        )
+
+        assertEquals(
+            StopDispatchResult.DISPATCHED,
+            dispatcher.dispatchStop(
+                instanceId = creating.id,
+                targetMember = hazelcastInstance.cluster.localMember,
+                force = true,
+                transitionAt = 3
+            )
+        )
+        val stopping = assertNotNull(state.getInstance(creating.id))
+        val generation = state.getLifecycleGeneration(creating.id)
+        assertTrue(
+            state.completeInstanceTermination(
+                expectedInstance = stopping,
+                expectedGeneration = generation,
+                finalState = InstanceState.STOPPED
+            )
+        )
+
+        assertEquals(0, state.getNodeResources(wrapperId).usedRamMB)
+        assertEquals(0, state.getNodeResources(wrapperId).usedCpu)
+    }
+
+    @Test
     fun `task dispatcher cannot overwrite claimed stopped snapshot`() {
         val wrapperId = localMemberId()
         state.addNodeResources(wrapperId, configuration.ramMB, configuration.cpu)
@@ -533,12 +562,6 @@ class InstanceCountEnforcerTest {
         )
         state.configurations.clear()
         state.putConfiguration(configuration)
-        val testStaticPath = Path.of("./static/${configuration.name}")
-            .toAbsolutePath()
-            .normalize()
-        assertTrue(Files.notExists(testStaticPath))
-        testOwnedStaticPaths.add(testStaticPath)
-
         val portAllocator = PortAllocator(state)
         val runtime = RecordingRuntimeProvider()
         val runtimeRegistry = RuntimeRegistryImpl().apply { register("fake", runtime) }
@@ -549,7 +572,8 @@ class InstanceCountEnforcerTest {
             portAllocator,
             TemplateManager(variableRegistry, TemplateStorageRegistryImpl()),
             variableRegistry,
-            hazelcastInstance
+            hazelcastInstance,
+            InstanceWorkspace(tempDir)
         )
         val wrapperId = localMemberId()
         val oldInstance = instance(
@@ -564,8 +588,9 @@ class InstanceCountEnforcerTest {
             runtime = configuration.runtime
         )
         portAllocator.reserve(singlePort)
-        state.addNodeResources(wrapperId, configuration.ramMB, configuration.cpu)
-        state.putInstance(oldInstance)
+        val oldCreating = oldInstance.copy(state = InstanceState.CREATING, processPid = null)
+        assertTrue(state.reserveCreatingInstance(oldCreating, 1, 1024, 100))
+        assertTrue(state.promoteCreatingInstance(oldCreating, 1, oldInstance))
 
         assertEquals(
             StopDispatchResult.DISPATCHED,
@@ -583,7 +608,12 @@ class InstanceCountEnforcerTest {
         assertEquals(setOf("old001"), state.getAllInstances().mapTo(mutableSetOf()) { it.id })
         assertEquals(InstanceState.STOPPING, state.getInstance("old001")?.state)
 
-        router.route(StopInstanceTask("old001"))
+        router.route(
+            StopInstanceTask(
+                "old001",
+                expectedGeneration = state.getLifecycleGeneration("old001")
+            )
+        )
         assertEquals(InstanceState.STOPPED, state.getInstance("old001")?.state)
         assertTrue(singlePort !in portAllocator.getLocalAllocations())
 
@@ -606,6 +636,21 @@ class InstanceCountEnforcerTest {
     )
 
     private fun localMemberId(): String = hazelcastInstance.cluster.localMember.uuid.toString()
+
+    private fun putOwnedInstance(instance: InstanceInfo, generation: Long = 1L) {
+        val creating = instance.copy(state = InstanceState.CREATING)
+        assertTrue(
+            state.reserveCreatingInstance(
+                creating,
+                generation,
+                maxRamMB = Int.MAX_VALUE,
+                maxCpu = Int.MAX_VALUE
+            )
+        )
+        if (instance.state != InstanceState.CREATING) {
+            state.updateInstanceState(instance.id, instance.state, instance.lastHeartbeat)
+        }
+    }
 
     @Suppress("UNCHECKED_CAST")
     private fun absentMember(uuid: UUID): Member = Proxy.newProxyInstance(
@@ -683,13 +728,6 @@ class InstanceCountEnforcerTest {
         runtime = configuration.runtime
     )
 
-    private fun deleteRecursively(path: Path) {
-        if (!Files.exists(path)) return
-        Files.walk(path).use { paths ->
-            paths.sorted(Comparator.reverseOrder()).forEach(Files::deleteIfExists)
-        }
-    }
-
     private data class StopInvocation(
         val instanceId: String,
         val memberId: String,
@@ -765,8 +803,7 @@ class InstanceCountEnforcerTest {
     ) : InstanceSpawner {
         override fun createInstance(configuration: Configuration, instanceId: String?): InstanceInfo? {
             val id = instanceId ?: "new001"
-            state.putInstance(
-                InstanceInfo(
+            val creating = InstanceInfo(
                     id = id,
                     configurationName = configuration.name,
                     wrapperNodeId = wrapperId,
@@ -779,8 +816,8 @@ class InstanceCountEnforcerTest {
                     allocatedCpu = configuration.cpu,
                     runtime = configuration.runtime
                 )
-            )
-            router.route(DeployInstanceTask(id, configuration.name))
+            if (!state.reserveCreatingInstance(creating, 1, 1024, 100)) return null
+            router.route(DeployInstanceTask(id, configuration.name, expectedGeneration = 1))
             return state.getInstance(id)
         }
     }

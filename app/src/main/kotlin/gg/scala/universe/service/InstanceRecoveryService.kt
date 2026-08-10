@@ -6,6 +6,7 @@ import com.hazelcast.core.HazelcastInstance
 import gg.scala.universe.console.LogLevel
 import gg.scala.universe.console.log
 import gg.scala.universe.hz.ClusterStateService
+import gg.scala.universe.hz.task.InstanceWorkspace
 import gg.scala.universe.runtime.PortAllocator
 import gg.scala.universe.runtime.RuntimeRegistry
 import gg.scala.universe.schema.InstanceInfo
@@ -13,7 +14,6 @@ import gg.scala.universe.schema.InstanceState
 import gg.scala.universe.util.json.Serializers
 import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.Paths
 import java.util.Comparator
 
 /**
@@ -31,7 +31,8 @@ class InstanceRecoveryService @Inject constructor(
     private val clusterStateService: ClusterStateService,
     private val hazelcastInstance: HazelcastInstance,
     private val runtimeRegistry: RuntimeRegistry,
-    private val portAllocator: PortAllocator
+    private val portAllocator: PortAllocator,
+    private val workspace: InstanceWorkspace = InstanceWorkspace()
 ) {
 
     fun recover() {
@@ -51,18 +52,22 @@ class InstanceRecoveryService @Inject constructor(
         }
 
         // 2. Recover from filesystem state files (for full cluster restarts)
-        val runningDir = Paths.get("./running").toAbsolutePath().normalize()
-        if (Files.exists(runningDir)) {
-            Files.list(runningDir).use { stream ->
+        val runningDir = workspace.runningRoot()
+        val staticDir = workspace.staticRoot()
+        for (stateRoot in listOf(runningDir, staticDir)) {
+            if (!Files.exists(stateRoot)) continue
+            Files.list(stateRoot).use { stream ->
                 stream.filter { Files.isDirectory(it) }
-                    .filter { !recovered.contains(it.fileName.toString()) }
                     .forEach { dir ->
                         val stateFile = dir.resolve(".universe-state.json")
                         if (Files.exists(stateFile)) {
                             try {
                                 val json = Files.readString(stateFile)
                                 val instance = Serializers.GSON.fromJson(json, InstanceInfo::class.java)
-                                if (instance != null && verifyAndRegister(instance)) {
+                                if (
+                                    instance != null && instance.id !in recovered &&
+                                    verifyAndRegister(instance)
+                                ) {
                                     recovered.add(instance.id)
                                 }
                             } catch (e: Exception) {
@@ -75,13 +80,21 @@ class InstanceRecoveryService @Inject constructor(
 
         // 3. Check runtime providers for any instances not yet recovered
         for ((runtimeKey, provider) in runtimeRegistry.getAll()) {
-            val instanceIds = provider.listRunningInstances()
+            val instanceIds = try {
+                provider.listRunningInstances()
+            } catch (failure: Exception) {
+                log(
+                    "Could not discover instances from runtime '$runtimeKey': ${failure.message}",
+                    LogLevel.WARNING
+                )
+                continue
+            }
             for (id in instanceIds) {
                 if (recovered.contains(id)) continue
 
                 // Try to find state file for this instance
-                val stateFile = runningDir.resolve(id).resolve(".universe-state.json")
-                val instance = if (Files.exists(stateFile)) {
+                val stateFile = findStateFile(id, runningDir, staticDir)
+                val instance = if (stateFile != null && Files.exists(stateFile)) {
                     try {
                         val json = Files.readString(stateFile)
                         Serializers.GSON.fromJson(json, InstanceInfo::class.java)
@@ -89,7 +102,10 @@ class InstanceRecoveryService @Inject constructor(
                         null
                     }
                 } else {
-                    null
+                    // Kubernetes workloads can survive a wrapper restart even
+                    // without a local state directory. The pod label supplies
+                    // the id; reuse its durable master-side metadata.
+                    clusterStateService.getInstance(id)
                 }
 
                 if (instance != null && verifyAndRegister(instance)) {
@@ -118,15 +134,27 @@ class InstanceRecoveryService @Inject constructor(
         // don't cause us to check the wrong runtime provider.
         val runtimeKey = instance.runtime
         val provider = runtimeRegistry.get(runtimeKey)
-            ?: runtimeRegistry.getAll().values.firstOrNull()
 
         if (provider == null) {
-            log("No runtime provider for recovered instance ${instance.id}, marking OFFLINE", LogLevel.WARNING)
-            clusterStateService.updateInstanceState(instance.id, InstanceState.OFFLINE)
+            log(
+                "No runtime provider '$runtimeKey' for recovered instance ${instance.id}; " +
+                    "leaving lifecycle ownership unchanged",
+                LogLevel.WARNING
+            )
             return false
         }
 
-        if (!provider.isRunning(instance.id)) {
+        val running = try {
+            provider.isRunning(instance.id)
+        } catch (failure: Exception) {
+            log(
+                "Could not confirm runtime state for recovered instance ${instance.id}: " +
+                    "${failure.message}; leaving lifecycle ownership unchanged",
+                LogLevel.WARNING
+            )
+            return false
+        }
+        if (!running) {
             log("Instance ${instance.id} is no longer running, cleaning up", LogLevel.WARNING)
             cleanupDeadInstance(instance, config)
             return false
@@ -134,19 +162,18 @@ class InstanceRecoveryService @Inject constructor(
 
         // Instance is running — register it
         val updated = instance.copy(
+            wrapperNodeId = hazelcastInstance.cluster.localMember.uuid.toString(),
             state = InstanceState.ONLINE,
             lastHeartbeat = System.currentTimeMillis()
         )
-        if (!clusterStateService.putInstance(updated)) {
+        val generation = maxOf(1L, clusterStateService.getLifecycleGeneration(instance.id))
+        if (!clusterStateService.recoverInstance(updated, generation)) {
             log("Recovery of instance ${instance.id} was superseded by cleanup", LogLevel.WARNING)
             return false
         }
 
         // Re-allocate port to mark it as used
         portAllocator.reserve(instance.allocatedPort)
-
-        // Track node resources
-        clusterStateService.addNodeResources(instance.wrapperNodeId, instance.allocatedRamMB, instance.allocatedCpu)
 
         log("Recovered instance ${instance.id} (config=${instance.configurationName}, port=${instance.allocatedPort})", LogLevel.SUCCESS)
         return true
@@ -155,7 +182,7 @@ class InstanceRecoveryService @Inject constructor(
     private fun cleanupDeadInstance(instance: InstanceInfo, config: gg.scala.universe.schema.Configuration?) {
         portAllocator.release(instance.allocatedPort)
         if (config?.static != true) {
-            val workingDir = Paths.get("./running/${instance.id}").toAbsolutePath().normalize()
+            val workingDir = workspace.dynamicInstance(instance.id)
             try {
                 if (Files.exists(workingDir)) {
                     Files.walk(workingDir)
@@ -169,7 +196,28 @@ class InstanceRecoveryService @Inject constructor(
 
         clusterStateService.completeInstanceTermination(
             expectedInstance = instance,
+            expectedGeneration = clusterStateService.getLifecycleGeneration(instance.id),
             finalState = InstanceState.OFFLINE
         )
+    }
+
+    private fun findStateFile(id: String, runningDir: Path, staticDir: Path): Path? {
+        val dynamic = runningDir.resolve(id).resolve(".universe-state.json")
+        if (Files.exists(dynamic)) return dynamic
+        if (!Files.exists(staticDir)) return null
+        return Files.list(staticDir).use { stream ->
+            stream.filter { Files.isDirectory(it) }
+                .map { it.resolve(".universe-state.json") }
+                .filter { Files.exists(it) }
+                .filter { path ->
+                    runCatching {
+                        Serializers.GSON.fromJson(
+                            Files.readString(path), InstanceInfo::class.java
+                        )?.id == id
+                    }.getOrDefault(false)
+                }
+                .findFirst()
+                .orElse(null)
+        }
     }
 }

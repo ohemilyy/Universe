@@ -59,7 +59,8 @@ class TaskDispatcher @Inject constructor(
         log("Dispatching deploy task for instance ${instanceInfo.id} to node ${targetMember.nodeName()}")
         val task = DeployInstanceTask(
             instanceId = instanceInfo.id,
-            configurationName = instanceInfo.configurationName
+            configurationName = instanceInfo.configurationName,
+            expectedGeneration = clusterStateService.getLifecycleGeneration(instanceInfo.id)
         )
         submit(task, targetMember)
     }
@@ -73,9 +74,10 @@ class TaskDispatcher @Inject constructor(
         transitionAt: Long
     ): StopDispatchResult {
         val instances = clusterStateService.instances
-        lateinit var originalInstance: InstanceInfo
-        lateinit var stoppingInstance: InstanceInfo
-        lateinit var submission: Future<String>
+        val originalInstance: InstanceInfo
+        val stoppingInstance: InstanceInfo
+        val originalGeneration: Long
+        val stoppingGeneration: Long
         instances.lock(instanceId)
         try {
             val instance = instances[instanceId]
@@ -101,40 +103,63 @@ class TaskDispatcher @Inject constructor(
             }
 
             originalInstance = instance
+            originalGeneration = clusterStateService.getLifecycleGeneration(instanceId)
+            stoppingGeneration = if (instance.state == InstanceState.STOPPING) {
+                originalGeneration
+            } else {
+                originalGeneration + 1
+            }
             stoppingInstance = instance.copy(
                 state = InstanceState.STOPPING,
                 lastHeartbeat = transitionAt
             )
-            instances[instanceId] = stoppingInstance
-            log("Dispatching stop task for instance $instanceId to node ${targetMember.nodeName()}")
-            submission = try {
-                stopTaskSubmissionGateway.submit(
-                    StopInstanceTask(instanceId, force, restart),
-                    targetMember
-                )
-            } catch (failure: RuntimeException) {
-                restoreTransitionIfCurrent(instanceId, stoppingInstance, originalInstance)
-                return submissionFailureResult(targetMember, failure)
-            }
         } finally {
             instances.unlock(instanceId)
         }
 
+        if (!clusterStateService.transitionLifecycle(
+                originalInstance,
+                originalGeneration,
+                stoppingInstance,
+                stoppingGeneration
+            )
+        ) {
+            return if (clusterStateService.getInstance(instanceId)?.state == InstanceState.STOPPING) {
+                StopDispatchResult.ALREADY_STOPPING
+            } else {
+                StopDispatchResult.STALE_TRANSITION
+            }
+        }
+        log("Dispatching stop task for instance $instanceId to node ${targetMember.nodeName()}")
+        val submission = try {
+            stopTaskSubmissionGateway.submit(
+                StopInstanceTask(instanceId, force, restart, stoppingGeneration),
+                targetMember
+            )
+        } catch (failure: RuntimeException) {
+            restoreTransitionIfCurrent(
+                stoppingInstance, originalInstance, stoppingGeneration, originalGeneration
+            )
+            return submissionFailureResult(targetMember, failure)
+        }
+
         return awaitSubmission(
-            instanceId = instanceId,
             targetMember = targetMember,
             submission = submission,
             stoppingInstance = stoppingInstance,
-            originalInstance = originalInstance
+            originalInstance = originalInstance,
+            stoppingGeneration = stoppingGeneration,
+            originalGeneration = originalGeneration
         )
     }
 
     private fun awaitSubmission(
-        instanceId: String,
         targetMember: Member,
         submission: Future<String>,
         stoppingInstance: InstanceInfo,
-        originalInstance: InstanceInfo
+        originalInstance: InstanceInfo,
+        stoppingGeneration: Long,
+        originalGeneration: Long
     ): StopDispatchResult {
         return try {
             submission.get(STOP_SUBMISSION_ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)
@@ -143,31 +168,35 @@ class TaskDispatcher @Inject constructor(
             StopDispatchResult.DISPATCHED
         } catch (failure: InterruptedException) {
             Thread.currentThread().interrupt()
-            restoreTransitionIfCurrent(instanceId, stoppingInstance, originalInstance)
+            restoreTransitionIfCurrent(
+                stoppingInstance, originalInstance, stoppingGeneration, originalGeneration
+            )
             StopDispatchResult.SUBMISSION_FAILED
         } catch (failure: CancellationException) {
-            restoreTransitionIfCurrent(instanceId, stoppingInstance, originalInstance)
+            restoreTransitionIfCurrent(
+                stoppingInstance, originalInstance, stoppingGeneration, originalGeneration
+            )
             submissionFailureResult(targetMember, failure)
         } catch (failure: ExecutionException) {
-            restoreTransitionIfCurrent(instanceId, stoppingInstance, originalInstance)
+            restoreTransitionIfCurrent(
+                stoppingInstance, originalInstance, stoppingGeneration, originalGeneration
+            )
             submissionFailureResult(targetMember, failure.cause ?: failure)
         }
     }
 
     private fun restoreTransitionIfCurrent(
-        instanceId: String,
         stoppingInstance: InstanceInfo,
-        originalInstance: InstanceInfo
+        originalInstance: InstanceInfo,
+        stoppingGeneration: Long,
+        originalGeneration: Long
     ) {
-        val instances = clusterStateService.instances
-        instances.lock(instanceId)
-        try {
-            if (instances[instanceId] == stoppingInstance) {
-                instances[instanceId] = originalInstance
-            }
-        } finally {
-            instances.unlock(instanceId)
-        }
+        clusterStateService.transitionLifecycle(
+            stoppingInstance,
+            stoppingGeneration,
+            originalInstance,
+            originalGeneration
+        )
     }
 
     private fun submissionFailureResult(

@@ -35,4 +35,16 @@ class StopDispatchSemanticsTest {
             StopDispatchResult.DISPATCHED.toRequestOutcome(restart = true)
         )
     }
+
+    @Test
+    fun `target and submission failures are service unavailable`() {
+        assertEquals(
+            StopDispatchOutcome.SERVICE_UNAVAILABLE,
+            StopDispatchResult.TARGET_UNAVAILABLE.toRequestOutcome(restart = false)
+        )
+        assertEquals(
+            StopDispatchOutcome.SERVICE_UNAVAILABLE,
+            StopDispatchResult.SUBMISSION_FAILED.toRequestOutcome(restart = true)
+        )
+    }
 }

@@ -21,8 +21,10 @@ import gg.scala.universe.template.TemplateVariableRegistry
 import gg.scala.universe.util.json.Serializers
 import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.Paths
 import java.util.Comparator
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 @Singleton
 class TaskRouter @Inject constructor(
@@ -31,8 +33,11 @@ class TaskRouter @Inject constructor(
     private val portAllocator: PortAllocator,
     private val templateManager: TemplateManager,
     private val variableRegistry: TemplateVariableRegistry,
-    private val hazelcastInstance: HazelcastInstance
+    private val hazelcastInstance: HazelcastInstance,
+    private val workspace: InstanceWorkspace = InstanceWorkspace()
 ) {
+    private val lifecycleLocks = ConcurrentHashMap<String, ReentrantLock>()
+
     fun route(task: UniverseTask) {
         when (task) {
             is DeployInstanceTask -> handleDeploy(task)
@@ -43,7 +48,25 @@ class TaskRouter @Inject constructor(
     }
 
     private fun handleDeploy(task: DeployInstanceTask) {
+        lifecycleLocks.computeIfAbsent(task.instanceId) { ReentrantLock() }.withLock {
+            handleDeployLocked(task)
+        }
+    }
+
+    private fun handleDeployLocked(task: DeployInstanceTask) {
         log("Routing deploy task for instance ${task.instanceId}")
+
+        val queuedInstance = clusterStateService.getInstance(task.instanceId)
+            ?: return log("Queued instance ${task.instanceId} no longer exists", LogLevel.WARNING)
+        if (!clusterStateService.isCurrentLifecycle(
+                queuedInstance,
+                task.expectedGeneration,
+                InstanceState.CREATING,
+                requireReservation = true
+            )
+        ) {
+            return log("Ignoring stale deploy task for instance ${task.instanceId}", LogLevel.WARNING)
+        }
 
         val configuration = clusterStateService.getConfiguration(task.configurationName)
             ?: return failQueuedDeployment(
@@ -59,8 +82,6 @@ class TaskRouter @Inject constructor(
         var allocatedPort: Int? = null
         var workingDir: Path? = null
         var runtimeStartAttempted = false
-        var resourcesAdded = false
-        var resourceNodeId: String? = null
 
         try {
             allocatedPort = portAllocator.allocate(configuration.availablePorts)
@@ -70,9 +91,9 @@ class TaskRouter @Inject constructor(
                 )
 
             workingDir = if (configuration.static) {
-                Paths.get("./static/${configuration.name}").toAbsolutePath().normalize()
+                workspace.staticConfiguration(configuration.name)
             } else {
-                Paths.get("./running/${task.instanceId}").toAbsolutePath().normalize()
+                workspace.dynamicInstance(task.instanceId)
             }
             Files.createDirectories(workingDir)
 
@@ -102,6 +123,15 @@ class TaskRouter @Inject constructor(
             }
             val resolvedConfiguration = configuration.copy(hostAddress = resolvedHostAddress)
 
+            if (!clusterStateService.isCurrentLifecycle(
+                    queuedInstance,
+                    task.expectedGeneration,
+                    InstanceState.CREATING,
+                    requireReservation = true
+                )
+            ) {
+                error("Queued instance ${task.instanceId} changed before runtime startup")
+            }
             runtimeStartAttempted = true
             val processHandle = runtimeProvider.start(
                 instanceId = task.instanceId,
@@ -116,44 +146,44 @@ class TaskRouter @Inject constructor(
 
             val finalHostAddress = runtimeProvider.getHostAddress(task.instanceId)
                 .ifBlank { resolvedHostAddress }
-            val queued = clusterStateService.getInstance(task.instanceId)
-                ?: error("Queued instance ${task.instanceId} disappeared during deployment")
-            val online = queued.copy(
+            val online = queuedInstance.copy(
                 state = InstanceState.ONLINE,
                 allocatedPort = allocatedPort,
                 processPid = processHandle.pid(),
                 hostAddress = finalHostAddress,
                 runtime = configuration.runtime
             )
-            if (!clusterStateService.putInstance(online)) {
-                error("Instance ${task.instanceId} is owned by reconciliation cleanup")
+            if (!clusterStateService.promoteCreatingInstance(
+                    queuedInstance,
+                    task.expectedGeneration,
+                    online
+                )
+            ) {
+                error("Instance ${task.instanceId} changed while the runtime was starting")
             }
-
-            resourceNodeId = online.wrapperNodeId
-            clusterStateService.addNodeResources(resourceNodeId, configuration.ramMB, configuration.cpu)
-            resourcesAdded = true
 
             writeStateFile(workingDir, online)
             log("Instance ${task.instanceId} deployed with PID ${processHandle.pid()}", LogLevel.SUCCESS)
         } catch (failure: Exception) {
+            var teardownConfirmed = !runtimeStartAttempted
             if (runtimeStartAttempted) {
                 try {
                     runtimeProvider.stop(task.instanceId)
+                    teardownConfirmed = true
                 } catch (stopFailure: Exception) {
                     log(
-                        "Failed to stop runtime after deployment failure for ${task.instanceId}: ${stopFailure.message}",
-                        LogLevel.WARNING
+                        "Failed to confirm runtime teardown after deployment failure for ${task.instanceId}: " +
+                            "${stopFailure.message}; retaining lifecycle ownership",
+                        LogLevel.ERROR
                     )
                 }
             }
+            if (!teardownConfirmed) return
             allocatedPort?.let(portAllocator::release)
-            if (resourcesAdded && resourceNodeId != null) {
-                clusterStateService.removeNodeResources(resourceNodeId, configuration.ramMB, configuration.cpu)
-            }
             if (!configuration.static && workingDir != null) {
                 cleanupWorkingDirectory(task.instanceId, workingDir)
             }
-            clusterStateService.removeInstance(task.instanceId)
+            clusterStateService.cancelCreatingInstance(queuedInstance, task.expectedGeneration)
 
             val cause = failure.cause ?: failure
             val reason = "${cause.javaClass.simpleName}: ${cause.message ?: "no details"}"
@@ -162,22 +192,38 @@ class TaskRouter @Inject constructor(
     }
 
     private fun failQueuedDeployment(task: DeployInstanceTask, reason: String) {
-        clusterStateService.removeInstance(task.instanceId)
+        val queued = clusterStateService.getInstance(task.instanceId)
+        if (queued != null) {
+            clusterStateService.cancelCreatingInstance(queued, task.expectedGeneration)
+        }
         log("$reason; removed queued instance", LogLevel.ERROR)
     }
 
     private fun handleStop(task: StopInstanceTask) {
+        lifecycleLocks.computeIfAbsent(task.instanceId) { ReentrantLock() }.withLock {
+            handleStopLocked(task)
+        }
+    }
+
+    private fun handleStopLocked(task: StopInstanceTask) {
         log("Routing stop task for instance ${task.instanceId}")
 
         val instance = clusterStateService.getInstance(task.instanceId)
             ?: return log("Instance ${task.instanceId} not found", LogLevel.WARNING)
+        if (!clusterStateService.isCurrentLifecycle(
+                instance,
+                task.expectedGeneration,
+                InstanceState.STOPPING
+            )
+        ) {
+            return log("Ignoring stale stop task for instance ${task.instanceId}", LogLevel.WARNING)
+        }
 
         // Use the runtime that was stored at instance creation time, not the current config,
         // so config reloads/changes don't break stopping existing instances.
         val runtimeKey = instance.runtime
 
         val runtimeProvider = runtimeRegistry.get(runtimeKey)
-            ?: runtimeRegistry.getAll().values.firstOrNull()
             ?: return log("No runtime provider '$runtimeKey' available to stop instance ${task.instanceId}", LogLevel.ERROR)
 
         val configuration = clusterStateService.getConfiguration(instance.configurationName)
@@ -195,11 +241,20 @@ class TaskRouter @Inject constructor(
             }
         }
 
+        if (!clusterStateService.isCurrentLifecycle(
+                instance,
+                task.expectedGeneration,
+                InstanceState.STOPPING
+            )
+        ) {
+            return log("Stop token for instance ${task.instanceId} changed before teardown", LogLevel.WARNING)
+        }
         runtimeProvider.stop(task.instanceId)
         portAllocator.release(instance.allocatedPort)
         cleanupWorkingDirectory(instance, configuration)
         val completed = clusterStateService.completeInstanceTermination(
             expectedInstance = instance,
+            expectedGeneration = task.expectedGeneration,
             finalState = InstanceState.STOPPED
         )
         if (!completed) {
@@ -211,14 +266,19 @@ class TaskRouter @Inject constructor(
         log("Instance ${task.instanceId} stopped")
 
         if (task.restart) {
+            val stopped = clusterStateService.getInstance(task.instanceId)
+                ?: return log("Stopped instance ${task.instanceId} disappeared before restart", LogLevel.WARNING)
+            val nextGeneration = task.expectedGeneration + 1
             val queued = instance.copy(
                 state = InstanceState.CREATING,
                 allocatedPort = 0,
                 processPid = null,
                 lastHeartbeat = System.currentTimeMillis()
             )
-            clusterStateService.putInstance(queued)
-            handleDeploy(DeployInstanceTask(queued.id, queued.configurationName))
+            if (!clusterStateService.reserveRestartCreating(stopped, queued, nextGeneration)) {
+                return log("Could not reserve resources to restart instance ${task.instanceId}", LogLevel.WARNING)
+            }
+            handleDeploy(DeployInstanceTask(queued.id, queued.configurationName, nextGeneration))
         }
     }
 
@@ -227,7 +287,7 @@ class TaskRouter @Inject constructor(
         configuration: Configuration?
     ) {
         if (configuration?.static != true) {
-            val workingDir = Paths.get("./running/${instance.id}").toAbsolutePath().normalize()
+            val workingDir = workspace.dynamicInstance(instance.id)
             cleanupWorkingDirectory(instance.id, workingDir)
         }
     }
@@ -272,16 +332,30 @@ class TaskRouter @Inject constructor(
         // Stop all instances assigned to this node
         val localInstances = clusterStateService.getAllInstances()
             .filter { it.wrapperNodeId == hazelcastInstance.cluster.localMember.uuid.toString() }
-            .filter { it.state == InstanceState.ONLINE || it.state == InstanceState.CREATING }
+            .filter {
+                it.state == InstanceState.ONLINE ||
+                    it.state == InstanceState.CREATING ||
+                    it.state == InstanceState.STOPPING
+            }
 
         localInstances.forEach { instance ->
             try {
+                val generation = clusterStateService.getLifecycleGeneration(instance.id)
+                if (!clusterStateService.isCurrentLifecycle(instance, generation, instance.state)) {
+                    return@forEach
+                }
                 val runtimeProvider = runtimeRegistry.get(instance.runtime)
-                    ?: runtimeRegistry.getAll().values.firstOrNull()
-                runtimeProvider?.stop(instance.id)
+                    ?: error("No runtime provider '${instance.runtime}' available for ${instance.id}")
+                if (!clusterStateService.isCurrentLifecycle(instance, generation, instance.state)) {
+                    return@forEach
+                }
+                runtimeProvider.stop(instance.id)
                 portAllocator.release(instance.allocatedPort)
+                val configuration = clusterStateService.getConfiguration(instance.configurationName)
+                cleanupWorkingDirectory(instance, configuration)
                 clusterStateService.completeInstanceTermination(
                     expectedInstance = instance,
+                    expectedGeneration = generation,
                     finalState = InstanceState.STOPPED
                 )
                 log("Stopped instance ${instance.id} during shutdown")
