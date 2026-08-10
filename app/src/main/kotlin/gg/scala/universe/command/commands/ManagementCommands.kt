@@ -294,35 +294,11 @@ class ManagementCommands @Inject constructor(
             return
         }
 
-        val config = clusterStateService.getConfiguration(instance.configurationName)
-        if (config == null) {
-            source.sendMessage("Configuration '${instance.configurationName}' not found.")
-            return
-        }
-
-        // Stop existing
         val member = hazelcastInstance.cluster.members.firstOrNull {
             it.uuid.toString() == instance.wrapperNodeId
         } ?: hazelcastInstance.cluster.localMember
-        taskDispatcher.dispatchStop(instanceId, member)
-        source.sendMessage("Stopping instance $instanceId for restart...")
-
-        // Wait a moment for stop to process
-        Thread.sleep(500)
-
-        // Create new
-        val newInstance = if (config.static) {
-            instanceCreationService.createInstance(config, instanceId)
-        } else {
-            instanceCreationService.createInstance(config)
-        }
-
-        if (newInstance == null) {
-            source.sendMessage("Failed to restart instance: no node has enough resources.")
-            return
-        }
-
-        source.sendMessage("Restarted instance as ${newInstance.id} on node ${newInstance.wrapperNodeId}")
+        taskDispatcher.dispatchStop(instanceId, member, restart = true)
+        source.sendMessage("Restart queued for instance $instanceId...")
     }
 
     @Command("instance|instances kill <id>")
@@ -340,9 +316,8 @@ class ManagementCommands @Inject constructor(
             it.uuid.toString() == instance.wrapperNodeId
         } ?: hazelcastInstance.cluster.localMember
 
-        taskDispatcher.dispatchStop(instanceId, member)
-        clusterStateService.updateInstanceState(instanceId, InstanceState.STOPPED)
-        source.sendMessage("Force-killed instance $instanceId.")
+        taskDispatcher.dispatchStop(instanceId, member, force = true)
+        source.sendMessage("Force-stop dispatched for instance $instanceId.")
     }
 
     @Command("instance|instances logs <id>")

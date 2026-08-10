@@ -23,7 +23,7 @@ class InstanceCreationService @Inject constructor(
     private val clusterStateService: ClusterStateService,
     private val hazelcastInstance: HazelcastInstance,
     private val taskDispatcher: TaskDispatcher
-) {
+) : InstanceSpawner {
 
     /**
      * Creates a single instance from the given configuration.
@@ -33,7 +33,7 @@ class InstanceCreationService @Inject constructor(
      * @param instanceId Optional explicit ID (for static instances). If null, a random ID is generated.
      * @return The created [InstanceInfo] if a suitable node was found, null otherwise.
      */
-    fun createInstance(configuration: Configuration, instanceId: String? = null): InstanceInfo? {
+    override fun createInstance(configuration: Configuration, instanceId: String?): InstanceInfo? {
         val id = instanceId ?: InstanceIdGenerator.generate()
 
         val wrapperMember = findBestNode(configuration)

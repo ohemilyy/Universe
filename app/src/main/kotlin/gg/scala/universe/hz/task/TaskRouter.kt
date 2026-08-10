@@ -8,6 +8,7 @@ import gg.scala.universe.console.log
 import gg.scala.universe.hz.ClusterStateService
 import gg.scala.universe.runtime.PortAllocator
 import gg.scala.universe.runtime.RuntimeRegistry
+import gg.scala.universe.schema.Configuration
 import gg.scala.universe.schema.InstanceInfo
 import gg.scala.universe.schema.InstanceState
 import gg.scala.universe.task.DeployInstanceTask
@@ -52,7 +53,16 @@ class TaskRouter @Inject constructor(
             ?: return log("Runtime '${configuration.runtime}' not registered for instance ${task.instanceId}", LogLevel.ERROR)
 
         val allocatedPort = portAllocator.allocate(configuration.availablePorts)
-            ?: return log("No available ports for instance ${task.instanceId} in range ${configuration.availablePorts.min}-${configuration.availablePorts.max}", LogLevel.ERROR)
+        if (allocatedPort == null) {
+            clusterStateService.removeInstance(task.instanceId)
+            log(
+                "No available ports for instance ${task.instanceId} in range " +
+                    "${configuration.availablePorts.min}-${configuration.availablePorts.max}; " +
+                    "removed queued instance so reconciliation can retry",
+                LogLevel.ERROR
+            )
+            return
+        }
 
         val workingDir = if (configuration.static) {
             Paths.get("./static/${configuration.name}").toAbsolutePath().normalize()
@@ -187,41 +197,57 @@ class TaskRouter @Inject constructor(
 
         val configuration = clusterStateService.getConfiguration(instance.configurationName)
 
-        // Try graceful shutdown first (e.g., send "stop" to a Minecraft server)
-        try {
-            if (runtimeProvider.isRunning(task.instanceId)) {
-                runtimeProvider.executeCommand(task.instanceId, "stop")
-                log("Sent graceful stop command to instance ${task.instanceId}, waiting 30s...")
-                Thread.sleep(30000)
+        if (!task.force) {
+            // Try graceful shutdown first (e.g., send "stop" to a Minecraft server)
+            try {
+                if (runtimeProvider.isRunning(task.instanceId)) {
+                    runtimeProvider.executeCommand(task.instanceId, "stop")
+                    log("Sent graceful stop command to instance ${task.instanceId}, waiting 30s...")
+                    Thread.sleep(30000)
+                }
+            } catch (e: Exception) {
+                log("Graceful stop failed for instance ${task.instanceId}: ${e.message}, forcing...", LogLevel.WARNING)
             }
-        } catch (e: Exception) {
-            log("Graceful stop failed for instance ${task.instanceId}: ${e.message}, forcing...", LogLevel.WARNING)
         }
 
         runtimeProvider.stop(task.instanceId)
         portAllocator.release(instance.allocatedPort)
+        cleanupWorkingDirectoryAndResources(instance, configuration)
+        clusterStateService.updateInstanceState(task.instanceId, InstanceState.STOPPED)
+        log("Instance ${task.instanceId} stopped")
 
-        // Clean up working directory (skip for static instances)
+        if (task.restart) {
+            val queued = instance.copy(
+                state = InstanceState.CREATING,
+                allocatedPort = 0,
+                processPid = null,
+                lastHeartbeat = System.currentTimeMillis()
+            )
+            clusterStateService.putInstance(queued)
+            handleDeploy(DeployInstanceTask(queued.id, queued.configurationName))
+        }
+    }
+
+    private fun cleanupWorkingDirectoryAndResources(
+        instance: InstanceInfo,
+        configuration: Configuration?
+    ) {
         if (configuration?.static != true) {
-            val workingDir = Paths.get("./running/${task.instanceId}").toAbsolutePath().normalize()
+            val workingDir = Paths.get("./running/${instance.id}").toAbsolutePath().normalize()
             deleteStateFile(workingDir)
             try {
                 if (Files.exists(workingDir)) {
                     Files.walk(workingDir)
                         .sorted(Comparator.reverseOrder())
                         .forEach { Files.deleteIfExists(it) }
-                    log("Cleaned up working directory for instance ${task.instanceId}")
+                    log("Cleaned up working directory for instance ${instance.id}")
                 }
             } catch (cleanupEx: Exception) {
-                log("Failed to clean up working directory for instance ${task.instanceId}: ${cleanupEx.message}", LogLevel.WARNING)
+                log("Failed to clean up working directory for instance ${instance.id}: ${cleanupEx.message}", LogLevel.WARNING)
             }
         }
 
-        // Release node resources
         clusterStateService.removeNodeResources(instance.wrapperNodeId, instance.allocatedRamMB, instance.allocatedCpu)
-
-        clusterStateService.updateInstanceState(task.instanceId, InstanceState.STOPPED)
-        log("Instance ${task.instanceId} stopped")
     }
 
     private fun handleExecute(task: ExecuteCommandTask) {

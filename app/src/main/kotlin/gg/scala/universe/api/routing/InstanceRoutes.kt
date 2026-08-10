@@ -197,9 +197,8 @@ fun Application.configureInstanceRoutes(
                     } ?: hazelcastInstance.cluster.localMember
 
                     taskDispatcher.dispatchStop(id, member)
-                    clusterStateService.updateInstanceState(id, InstanceState.STOPPED)
 
-                    call.respond(HttpStatusCode.OK, mapOf("message" to "Instance $id stopped"))
+                    call.respond(HttpStatusCode.Accepted, mapOf("message" to "Instance $id is stopping"))
                 }
 
                 patch("/{id}/lifecycle") {
@@ -252,17 +251,11 @@ fun Application.configureInstanceRoutes(
                         }
                         LifecycleTarget.STOP -> {
                             taskDispatcher.dispatchStop(id, member)
-                            clusterStateService.updateInstanceState(id, InstanceState.STOPPED)
-                            call.respond(HttpStatusCode.OK, mapOf("message" to "Instance $id stopped"))
+                            call.respond(HttpStatusCode.Accepted, mapOf("message" to "Instance $id is stopping"))
                         }
                         LifecycleTarget.RESTART -> {
-                            taskDispatcher.dispatchStop(id, member)
-                            clusterStateService.updateInstanceState(id, InstanceState.STOPPED)
-                            val config = clusterStateService.getConfiguration(instance.configurationName)
-                                ?: return@patch call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Configuration not found"))
-                            val newInstance = instanceCreationService.createInstance(config)
-                                ?: return@patch call.respond(HttpStatusCode.ServiceUnavailable, mapOf("error" to "No node has enough resources"))
-                            call.respond(HttpStatusCode.OK, mapOf("message" to "Instance restarted", "instance" to newInstance.toExternalApiView()))
+                            taskDispatcher.dispatchStop(id, member, restart = true)
+                            call.respond(HttpStatusCode.Accepted, mapOf("message" to "Instance $id restart queued"))
                         }
                     }
                 }

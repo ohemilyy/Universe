@@ -20,6 +20,7 @@ import gg.scala.universe.db.MySQLDatabaseProvider
 import gg.scala.universe.extension.ExtensionService
 import gg.scala.universe.metrics.MetricsRegistry
 import gg.scala.universe.metrics.MetricsRegistryImpl
+import gg.scala.universe.hz.task.TaskDispatcher
 import gg.scala.universe.runtime.RuntimeRegistry
 import gg.scala.universe.runtime.RuntimeRegistryImpl
 import gg.scala.universe.template.DefaultTemplateVariableProvider
@@ -29,6 +30,9 @@ import gg.scala.universe.template.TemplateStorageRegistryImpl
 import gg.scala.universe.template.TemplateSyncService
 import gg.scala.universe.template.TemplateVariableRegistry
 import gg.scala.universe.template.TemplateVariableRegistryImpl
+import gg.scala.universe.service.InstanceCreationService
+import gg.scala.universe.service.InstanceSpawner
+import gg.scala.universe.service.InstanceStopDispatcher
 import org.incendo.cloud.CommandManager
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -36,6 +40,9 @@ import java.util.concurrent.Executors
 class MainGuiceModule : AbstractModule() {
     override fun configure() {
         bind(RuntimeRegistry::class.java).to(RuntimeRegistryImpl::class.java).asEagerSingleton()
+        bind(TaskDispatcher::class.java).asEagerSingleton()
+        bind(InstanceStopDispatcher::class.java).to(TaskDispatcher::class.java)
+        bind(InstanceSpawner::class.java).to(InstanceCreationService::class.java)
         bind(CommandProvider::class.java).to(CommandProviderImpl::class.java).asEagerSingleton()
         bind(object : TypeLiteral<CommandManager<CommandSource>>() {}).to(DefaultCommandManager::class.java).asEagerSingleton()
         bind(TemplateStorageRegistry::class.java).to(TemplateStorageRegistryImpl::class.java).asEagerSingleton()

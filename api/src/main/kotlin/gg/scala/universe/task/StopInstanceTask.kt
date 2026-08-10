@@ -5,5 +5,7 @@ package gg.scala.universe.task
  */
 data class StopInstanceTask(
     val instanceId: String,
+    val force: Boolean = false,
+    val restart: Boolean = false,
     override val type: String = "stop"
 ) : UniverseTask

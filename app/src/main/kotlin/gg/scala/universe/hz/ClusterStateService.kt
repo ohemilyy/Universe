@@ -63,11 +63,15 @@ class ClusterStateService @Inject constructor(
         return instances.values.filter { it.wrapperNodeId == nodeId }
     }
 
-    fun updateInstanceState(id: String, state: InstanceState) {
+    fun updateInstanceState(
+        id: String,
+        state: InstanceState,
+        lastHeartbeat: Long = System.currentTimeMillis()
+    ) {
         val existing = instances[id] ?: return
         instances[id] = existing.copy(
             state = state,
-            lastHeartbeat = System.currentTimeMillis()
+            lastHeartbeat = lastHeartbeat
         )
     }
 
