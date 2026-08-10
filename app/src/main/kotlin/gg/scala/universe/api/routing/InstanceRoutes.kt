@@ -172,7 +172,7 @@ fun Application.configureInstanceRoutes(
                         )
                     }
 
-                    val updated = instance.copy(
+                    val updated = instance.withPluginStateReport(
                         state = newState,
                         lastHeartbeat = request.lastHeartbeat ?: System.currentTimeMillis()
                     )
@@ -293,3 +293,6 @@ data class ExecuteOnInstanceRequest(val command: String)
 
 internal fun InstanceInfo.toExternalApiView(): InstanceInfo =
     if (state == InstanceState.STOPPING) copy(state = InstanceState.ONLINE) else this
+
+internal fun InstanceInfo.withPluginStateReport(state: InstanceState, lastHeartbeat: Long): InstanceInfo =
+    if (this.state == InstanceState.STOPPING) this else copy(state = state, lastHeartbeat = lastHeartbeat)

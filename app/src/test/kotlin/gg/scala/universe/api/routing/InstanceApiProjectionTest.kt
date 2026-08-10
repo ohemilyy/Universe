@@ -26,4 +26,22 @@ class InstanceApiProjectionTest {
         assertEquals(InstanceState.STOPPING, stored.state)
         assertEquals(stored.id, external.id)
     }
+
+    @Test
+    fun `plugin state reports preserve master stopping state and transition timestamp`() {
+        val stopping = InstanceInfo(
+            id = "abc123",
+            configurationName = "site",
+            wrapperNodeId = "node-1",
+            hostAddress = "127.0.0.1",
+            allocatedPort = 25565,
+            state = InstanceState.STOPPING,
+            lastHeartbeat = 100,
+            processPid = 42
+        )
+
+        listOf(InstanceState.ONLINE, InstanceState.OFFLINE).forEach { reportedState ->
+            assertEquals(stopping, stopping.withPluginStateReport(reportedState, 200))
+        }
+    }
 }
