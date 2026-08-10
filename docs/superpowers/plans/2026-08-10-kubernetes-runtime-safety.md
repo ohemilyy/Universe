@@ -79,7 +79,7 @@ fun `wildcard-equivalent settings omit hostIP`() {
 
 - [ ] **Step 3: Run the focused tests and verify RED**
 
-Run: `./gradlew :extensions:runtime-k8s:test --tests "gg.scala.universe.k8s.K8sPortSpecTest"`
+Run: `./gradlew :extensions:extension-runtime-k8s:test --tests "gg.scala.universe.k8s.K8sPortSpecTest"`
 
 Expected: compilation fails because `K8sPortSpec` and `hostPortBindAddress` do not exist.
 
@@ -114,7 +114,7 @@ Add `hostPortBindAddress` to `SCHEMA.md` with `null` as the compatibility defaul
 
 - [ ] **Step 6: Run the focused tests and verify GREEN**
 
-Run: `./gradlew :extensions:runtime-k8s:test --tests "gg.scala.universe.k8s.K8sPortSpecTest"`
+Run: `./gradlew :extensions:extension-runtime-k8s:test --tests "gg.scala.universe.k8s.K8sPortSpecTest"`
 
 Expected: all bind-address cases pass.
 
@@ -184,7 +184,7 @@ Add a REST projection test asserting `STOPPING` becomes `ONLINE` without changin
 
 - [ ] **Step 2: Run focused tests and verify RED**
 
-Run: `./gradlew :app:test --tests "*InstanceLifecyclePolicyTest" --tests "*InstanceApiProjectionTest" :minecraft:api:test --tests "*InstanceInfoTest"`
+Run: `./gradlew :app:test --tests "*InstanceLifecyclePolicyTest" --tests "*InstanceApiProjectionTest" :minecraft:minecraft-api:test --tests "*InstanceInfoTest"`
 
 Expected: compilation fails because the internal state, policies, projection, and test dependencies are absent.
 
@@ -220,7 +220,7 @@ Reject client attempts to write `STOPPING` through `PUT /api/instances/{id}/stat
 
 - [ ] **Step 5: Run focused tests and verify GREEN**
 
-Run: `./gradlew :app:test --tests "*InstanceLifecyclePolicyTest" --tests "*InstanceApiProjectionTest" :minecraft:api:test --tests "*InstanceInfoTest"`
+Run: `./gradlew :app:test --tests "*InstanceLifecyclePolicyTest" --tests "*InstanceApiProjectionTest" :minecraft:minecraft-api:test --tests "*InstanceInfoTest"`
 
 Expected: lifecycle, REST projection, and future-state tolerance tests pass.
 
@@ -491,7 +491,7 @@ git commit -m "fix: recover stalled instance reconciliation"
 Run:
 
 ```bash
-./gradlew :extensions:runtime-k8s:test :app:test :minecraft:api:test
+./gradlew :extensions:extension-runtime-k8s:test :app:test :minecraft:minecraft-api:test
 ```
 
 Expected: zero failed tests.
@@ -501,8 +501,8 @@ Expected: zero failed tests.
 Run:
 
 ```bash
-./gradlew :api:check :extensions:extension-api:check :extensions:runtime-k8s:check :app:check :minecraft:api:check
-./gradlew :extensions:runtime-k8s:build :app:build
+./gradlew :api:check :extensions:extension-api:check :extensions:extension-runtime-k8s:check :app:check :minecraft:minecraft-api:check
+./gradlew :extensions:extension-runtime-k8s:build :app:build
 ```
 
 Expected: both commands exit 0 with no compilation or test failures.
