@@ -6,5 +6,7 @@ package gg.scala.universe.task
 data class DeployInstanceTask(
     val instanceId: String,
     val configurationName: String,
+    /** Master-owned incarnation token. Zero preserves compatibility with legacy payloads. */
+    val expectedGeneration: Long = 0,
     override val type: String = "deploy"
 ) : UniverseTask

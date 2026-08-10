@@ -15,7 +15,14 @@ import java.util.concurrent.ConcurrentHashMap
 @Singleton
 class ScreenRuntimeProvider : RuntimeProvider {
 
+    internal data class CommandResult(val exitCode: Int, val output: String, val error: String)
+
     private val sessions = ConcurrentHashMap<String, ProcessHandle>()
+    private var statusCommand: () -> CommandResult = ::runStatusCommand
+
+    internal fun useStatusCommandForTest(command: () -> CommandResult) {
+        statusCommand = command
+    }
 
     override fun start(
         instanceId: String,
@@ -30,7 +37,7 @@ class ScreenRuntimeProvider : RuntimeProvider {
         val sessionName = sessionName(instanceId)
 
         // Ensure any stale session with this name is cleaned up first
-        silentExec("screen", "-S", sessionName, "-X", "quit")
+        runCommand("screen", "-S", sessionName, "-X", "quit")
 
         // Build command with resource limit fallback prefix
         val prefix = CgroupResourceEnforcer.buildFallbackPrefix(ramMB, cpu)
@@ -59,7 +66,8 @@ class ScreenRuntimeProvider : RuntimeProvider {
 
     override fun stop(instanceId: String) {
         val sessionName = sessionName(instanceId)
-        silentExec("screen", "-S", sessionName, "-X", "quit")
+        runCommand("screen", "-S", sessionName, "-X", "quit")
+        check(!hasSession(sessionName)) { "Screen session '$sessionName' is still running" }
         sessions.remove(instanceId)
         CgroupResourceEnforcer.cleanupCgroup(instanceId)
         log("Stopped screen session '$sessionName' for instance $instanceId")
@@ -75,18 +83,7 @@ class ScreenRuntimeProvider : RuntimeProvider {
     }
 
     override fun isRunning(instanceId: String): Boolean {
-        val sessionName = sessionName(instanceId)
-        return try {
-            val process = ProcessBuilder("screen", "-ls")
-                .redirectOutput(ProcessBuilder.Redirect.PIPE)
-                .redirectError(ProcessBuilder.Redirect.DISCARD)
-                .start()
-            val output = process.inputStream.bufferedReader().readText()
-            process.waitFor()
-            output.contains(sessionName)
-        } catch (_: Exception) {
-            false
-        }
+        return hasSession(sessionName(instanceId))
     }
 
     override fun listRunningInstances(): List<String> {
@@ -102,8 +99,8 @@ class ScreenRuntimeProvider : RuntimeProvider {
                 .mapNotNull { line ->
                     Regex("universe-([a-zA-Z0-9]+)").find(line)?.groupValues?.get(1)
                 }
-        } catch (_: Exception) {
-            emptyList()
+        } catch (failure: Exception) {
+            throw IllegalStateException("Failed to discover screen sessions", failure)
         }
     }
 
@@ -126,11 +123,39 @@ class ScreenRuntimeProvider : RuntimeProvider {
 
     private fun sessionName(instanceId: String): String = "universe-$instanceId"
 
-    private fun silentExec(vararg command: String) {
-        try {
-            ProcessBuilder(*command).inheritIO().start().waitFor()
-        } catch (_: Exception) {
-            // ignored — session may not exist
+    private fun runCommand(vararg command: String): Int {
+        return ProcessBuilder(*command)
+            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+            .redirectError(ProcessBuilder.Redirect.DISCARD)
+            .start()
+            .waitFor()
+    }
+
+    private fun hasSession(sessionName: String): Boolean {
+        val result = statusCommand()
+        val output = result.output
+        val error = result.error
+        val exitCode = result.exitCode
+        val diagnostic = "$output\n$error"
+        return when {
+            exitCode == 0 -> output.contains(sessionName)
+            exitCode == 1 && (
+                diagnostic.contains("No Sockets found", ignoreCase = true) ||
+                    diagnostic.contains("No screen session found", ignoreCase = true)
+                ) -> false
+            else -> error(
+                "Unable to confirm screen session '$sessionName' state: ${diagnostic.trim()}"
+            )
         }
+    }
+
+    private fun runStatusCommand(): CommandResult {
+        val process = ProcessBuilder("screen", "-ls")
+            .redirectOutput(ProcessBuilder.Redirect.PIPE)
+            .redirectError(ProcessBuilder.Redirect.PIPE)
+            .start()
+        val output = process.inputStream.bufferedReader().readText()
+        val error = process.errorStream.bufferedReader().readText()
+        return CommandResult(process.waitFor(), output, error)
     }
 }

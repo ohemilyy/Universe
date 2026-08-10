@@ -6,11 +6,13 @@ import com.hazelcast.core.HazelcastInstance
 import gg.scala.universe.console.LogLevel
 import gg.scala.universe.console.log
 import gg.scala.universe.hz.ClusterStateService
+import gg.scala.universe.hz.task.InstanceWorkspace
 import gg.scala.universe.runtime.PortAllocator
 import gg.scala.universe.runtime.RuntimeRegistry
+import gg.scala.universe.runtime.RuntimeRecoveryInspector
+import gg.scala.universe.runtime.RuntimeResourceState
 import gg.scala.universe.schema.InstanceState
 import java.nio.file.Files
-import java.nio.file.Paths
 import java.util.Comparator
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -29,7 +31,8 @@ class InstanceHealthMonitor @Inject constructor(
     private val clusterStateService: ClusterStateService,
     private val hazelcastInstance: HazelcastInstance,
     private val runtimeRegistry: RuntimeRegistry,
-    private val portAllocator: PortAllocator
+    private val portAllocator: PortAllocator,
+    private val workspace: InstanceWorkspace = InstanceWorkspace()
 ) {
     private val executor = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "universe-health-monitor").apply { isDaemon = true }
@@ -56,7 +59,7 @@ class InstanceHealthMonitor @Inject constructor(
         }
     }
 
-    private fun checkHealth() {
+    internal fun checkHealth() {
         try {
             val localNodeId = hazelcastInstance.cluster.localMember.uuid.toString()
             val instances = clusterStateService.getAllInstances()
@@ -65,21 +68,45 @@ class InstanceHealthMonitor @Inject constructor(
             if (instances.isEmpty()) return
 
             for (instance in instances) {
-                val config = clusterStateService.getConfiguration(instance.configurationName)
-                // Use the runtime stored at instance creation time so config reloads
-                // don't cause us to check the wrong runtime provider.
-                val runtimeKey = instance.runtime
-                val runtimeProvider = runtimeRegistry.get(runtimeKey)
-
-                if (runtimeProvider == null) {
-                    log("No runtime provider '$runtimeKey' for instance ${instance.id}, marking OFFLINE", LogLevel.WARNING)
-                    markOffline(instance, config)
-                    continue
-                }
-
-                if (!runtimeProvider.isRunning(instance.id)) {
-                    log("Instance ${instance.id} is no longer running (runtime=$runtimeKey), marking OFFLINE", LogLevel.WARNING)
-                    markOffline(instance, config)
+                try {
+                    val config = clusterStateService.getConfiguration(instance.configurationName)
+                    val runtimeKey = instance.runtime
+                    val runtimeProvider = runtimeRegistry.get(runtimeKey)
+                    if (runtimeProvider == null) {
+                        log("No runtime provider '$runtimeKey' for ${instance.id}; retaining ownership", LogLevel.WARNING)
+                        continue
+                    }
+                    val workingDirectory = if (config?.static == true) {
+                        workspace.staticConfiguration(config.name)
+                    } else workspace.dynamicInstance(instance.id)
+                    val runtimeState = if (runtimeProvider is RuntimeRecoveryInspector) {
+                        runtimeProvider.inspectRecovered(
+                            instance.id,
+                            instance.processPid,
+                            workingDirectory
+                        )
+                    } else if (runtimeProvider.isRunning(instance.id)) {
+                        RuntimeResourceState.RUNNING
+                    } else RuntimeResourceState.ABSENT
+                    when (runtimeState) {
+                        RuntimeResourceState.RUNNING -> Unit
+                        RuntimeResourceState.ABSENT -> markOffline(instance, config)
+                        RuntimeResourceState.CLEANUP_REQUIRED,
+                        RuntimeResourceState.TERMINAL -> {
+                            runtimeProvider.stop(instance.id)
+                            markOffline(instance, config)
+                        }
+                        RuntimeResourceState.PRESENT_TRANSITIONAL,
+                        RuntimeResourceState.UNKNOWN -> log(
+                            "Runtime state for ${instance.id} is $runtimeState; retaining ownership",
+                            LogLevel.WARNING
+                        )
+                    }
+                } catch (failure: Exception) {
+                    log(
+                        "Health discovery failed for ${instance.id}: ${failure.message}; retaining ownership",
+                        LogLevel.WARNING
+                    )
                 }
             }
         } catch (e: Exception) {
@@ -88,20 +115,23 @@ class InstanceHealthMonitor @Inject constructor(
     }
 
     private fun markOffline(instance: gg.scala.universe.schema.InstanceInfo, config: gg.scala.universe.schema.Configuration?) {
+        val generation = clusterStateService.getLifecycleGeneration(instance.id)
+        if (!clusterStateService.isCurrentLifecycle(
+                instance, generation, InstanceState.ONLINE
+            )
+        ) return
         // Release port
         portAllocator.release(instance.allocatedPort)
 
-        // Release node resources
-        clusterStateService.removeNodeResources(instance.wrapperNodeId, instance.allocatedRamMB, instance.allocatedCpu)
-
         // Clean up working directory for non-static instances
         if (config?.static != true) {
-            val workingDir = Paths.get("./running/${instance.id}").toAbsolutePath().normalize()
+            val workingDir = workspace.dynamicInstance(instance.id)
             try {
                 if (Files.exists(workingDir)) {
-                    Files.walk(workingDir)
-                        .sorted(Comparator.reverseOrder())
-                        .forEach { Files.deleteIfExists(it) }
+                    Files.walk(workingDir).use { paths ->
+                        paths.sorted(Comparator.reverseOrder())
+                            .forEach { Files.deleteIfExists(it) }
+                    }
                     log("Cleaned up working directory for dead instance ${instance.id}", LogLevel.INFO)
                 }
             } catch (cleanupEx: Exception) {
@@ -109,12 +139,15 @@ class InstanceHealthMonitor @Inject constructor(
             }
         }
 
-        // Mark OFFLINE with updated heartbeat so we know when it went offline
-        val updated = instance.copy(
-            state = InstanceState.OFFLINE,
-            lastHeartbeat = System.currentTimeMillis()
+        val completed = clusterStateService.completeInstanceTermination(
+            expectedInstance = instance,
+            expectedGeneration = generation,
+            finalState = InstanceState.OFFLINE
         )
-        clusterStateService.putInstance(updated)
-        log("Instance ${instance.id} marked OFFLINE and resources released", LogLevel.INFO)
+        if (completed) {
+            log("Instance ${instance.id} marked OFFLINE and resources released", LogLevel.INFO)
+        } else {
+            log("Instance ${instance.id} termination was superseded", LogLevel.INFO)
+        }
     }
 }

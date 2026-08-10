@@ -5,8 +5,8 @@ import com.google.inject.Singleton
 import gg.scala.universe.console.LogLevel
 import gg.scala.universe.console.log
 import gg.scala.universe.hz.ClusterStateService
-import gg.scala.universe.schema.InstanceState
 import gg.scala.universe.schema.PortRange
+import gg.scala.universe.service.occupiesPort
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -45,9 +45,9 @@ class PortAllocator @Inject constructor(
      * @return The allocated port number, or `null` if none are available.
      */
     fun allocate(range: PortRange): Int? {
-        // Build a snapshot of ports already in use by active instances across the cluster
+        // Build a snapshot of ports held by instances across the cluster.
         val clusterUsedPorts = clusterStateService.getAllInstances()
-            .filter { it.state == InstanceState.ONLINE || it.state == InstanceState.CREATING }
+            .filter { it.state.occupiesPort }
             .map { it.allocatedPort }
             .toSet()
 
@@ -58,27 +58,33 @@ class PortAllocator @Inject constructor(
         }
 
         for (port in candidates) {
-            // 1. Check local in-memory allocations
-            if (allocatedPorts.contains(port)) {
+            // Claim locally before any slow cluster/OS probes. contains()+add() is not
+            // atomic and allowed concurrent callers to both return the same port.
+            if (!allocatedPorts.add(port)) {
                 log("Port $port skipped — already allocated locally", LogLevel.DEBUG)
                 continue
             }
 
-            // 2. Check cluster-wide active instances (all configurations)
-            if (port in clusterUsedPorts) {
-                log("Port $port skipped — in use by another instance in the cluster", LogLevel.DEBUG)
-                continue
-            }
+            var accepted = false
+            try {
+                // 2. Check cluster-wide active instances (all configurations)
+                if (port in clusterUsedPorts) {
+                    log("Port $port skipped — in use by another instance in the cluster", LogLevel.DEBUG)
+                    continue
+                }
 
-            // 3. OS-level availability check
-            if (!isPortAvailable(port)) {
-                log("Port $port skipped — bound by another process on this machine", LogLevel.DEBUG)
-                continue
-            }
+                // 3. OS-level availability check
+                if (!isPortAvailable(port)) {
+                    log("Port $port skipped — bound by another process on this machine", LogLevel.DEBUG)
+                    continue
+                }
 
-            allocatedPorts.add(port)
-            log("Allocated port $port (range ${range.min}-${range.max})")
-            return port
+                accepted = true
+                log("Allocated port $port (range ${range.min}-${range.max})")
+                return port
+            } finally {
+                if (!accepted) allocatedPorts.remove(port)
+            }
         }
 
         log("No available ports in range ${range.min}-${range.max}", LogLevel.ERROR)
@@ -98,9 +104,12 @@ class PortAllocator @Inject constructor(
      * Marks a port as used without checking availability.
      * Used during instance recovery to prevent duplicate allocation.
      */
-    fun reserve(port: Int) {
-        allocatedPorts.add(port)
-        log("Reserved port $port (recovered)")
+    fun reserve(port: Int): Boolean {
+        val reserved = allocatedPorts.add(port)
+        if (reserved) {
+            log("Reserved port $port (recovered)")
+        }
+        return reserved
     }
 
     /**

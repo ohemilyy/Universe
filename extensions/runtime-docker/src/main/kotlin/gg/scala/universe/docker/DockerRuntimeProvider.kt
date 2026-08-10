@@ -1,6 +1,8 @@
 package gg.scala.universe.docker
 
 import com.github.dockerjava.api.DockerClient
+import com.github.dockerjava.api.exception.NotFoundException
+import com.github.dockerjava.api.exception.NotModifiedException
 import com.github.dockerjava.api.model.Bind
 import com.github.dockerjava.api.model.ExposedPort
 import com.github.dockerjava.api.model.HostConfig
@@ -27,11 +29,20 @@ import java.util.stream.Stream
  * Each instance runs in a dedicated Docker container. The working directory
  * is bind-mounted into the container. Commands are executed via `docker exec`.
  */
-class DockerRuntimeProvider(
-    private val config: DockerConfig
+class DockerRuntimeProvider private constructor(
+    private val config: DockerConfig,
+    providedClient: DockerClient?,
+    @Suppress("UNUSED_PARAMETER") initializedWithProvidedClient: Boolean
 ) : RuntimeProvider {
 
-    private val dockerClient: DockerClient = createDockerClient()
+    constructor(config: DockerConfig) : this(config, null, false)
+
+    internal constructor(
+        config: DockerConfig,
+        dockerClient: DockerClient
+    ) : this(config, dockerClient, true)
+
+    private val dockerClient: DockerClient = providedClient ?: createDockerClient()
     private val containerIds = ConcurrentHashMap<String, String>()
 
     override fun start(
@@ -199,15 +210,40 @@ class DockerRuntimeProvider(
     }
 
     override fun stop(instanceId: String) {
-        val containerId = containerIds.remove(instanceId) ?: return
+        var containerId = containerIds[instanceId] ?: findContainerId(instanceId) ?: return
         try {
-            dockerClient.stopContainerCmd(containerId).withTimeout(config.stopTimeout).exec()
-            if (!config.autoRemove) {
-                dockerClient.removeContainerCmd(containerId).withForce(true).exec()
+            deleteContainer(containerId)
+            val rediscovered = findContainerId(instanceId)
+            if (rediscovered != null) {
+                containerId = rediscovered
+                deleteContainer(rediscovered)
             }
+            check(findContainerId(instanceId) == null) {
+                "Docker container 'universe-$instanceId' still exists after deletion"
+            }
+            containerIds.remove(instanceId)
             log("Stopped Docker container for instance $instanceId")
         } catch (e: Exception) {
             log("Failed to stop Docker container for instance $instanceId: ${e.message}", LogLevel.ERROR)
+            throw IllegalStateException(
+                "Failed to confirm Docker container teardown for instance $instanceId",
+                e
+            )
+        }
+    }
+
+    private fun deleteContainer(containerId: String) {
+        try {
+            dockerClient.stopContainerCmd(containerId).withTimeout(config.stopTimeout).exec()
+        } catch (_: NotModifiedException) {
+            // Already stopped; removal still confirms absence.
+        } catch (_: NotFoundException) {
+            // A canonical-name rediscovery is performed by the caller.
+        }
+        try {
+            dockerClient.removeContainerCmd(containerId).withForce(true).exec()
+        } catch (_: NotFoundException) {
+            // A canonical-name rediscovery is performed by the caller.
         }
     }
 
@@ -259,13 +295,18 @@ class DockerRuntimeProvider(
     }
 
     override fun isRunning(instanceId: String): Boolean {
-        val containerId = containerIds[instanceId] ?: return false
-        return try {
-            val info = dockerClient.inspectContainerCmd(containerId).exec()
-            info.state.running ?: false
-        } catch (_: Exception) {
-            false
+        var containerId = containerIds[instanceId] ?: findContainerId(instanceId) ?: return false
+        val info = try {
+            dockerClient.inspectContainerCmd(containerId).exec()
+        } catch (_: NotFoundException) {
+            containerIds.remove(instanceId, containerId)
+            containerId = findContainerId(instanceId) ?: return false
+            dockerClient.inspectContainerCmd(containerId).exec()
         }
+        containerIds[instanceId] = containerId
+        return info.state.running ?: error(
+            "Docker returned an unknown running state for container 'universe-$instanceId'"
+        )
     }
 
     override fun listRunningInstances(): List<String> {
@@ -277,8 +318,8 @@ class DockerRuntimeProvider(
                     container.names?.firstOrNull()?.removePrefix("/")?.takeIf { it.startsWith("universe-") }
                         ?.removePrefix("universe-")
                 }
-        } catch (_: Exception) {
-            emptyList()
+        } catch (failure: Exception) {
+            throw IllegalStateException("Failed to discover Docker instances", failure)
         }
     }
 
@@ -330,6 +371,22 @@ class DockerRuntimeProvider(
         } catch (_: Exception) {
             // ignored
         }
+    }
+
+    private fun findContainerId(instanceId: String): String? {
+        val expectedName = "universe-$instanceId"
+        return dockerClient.listContainersCmd()
+            .withShowAll(true)
+            .withNameFilter(listOf(expectedName))
+            .exec()
+            .firstOrNull { container ->
+                container.names?.any { it.removePrefix("/") == expectedName } == true
+            }
+            ?.id
+    }
+
+    internal fun rememberContainerForTest(instanceId: String, containerId: String) {
+        containerIds[instanceId] = containerId
     }
 
     /**

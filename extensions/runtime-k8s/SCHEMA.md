@@ -8,6 +8,7 @@ Configuration file: `./extensions/k8s/config.json`
 |-------|------|---------|-------------|
 | `factoryName` | string | `"kube"` | Runtime key used in instance configs (e.g., `"runtime": "kube"`) |
 | `namespace` | string | `"default"` | K8s namespace where Pods are created |
+| `hostPortBindAddress` | string | `null` | Optional host IP address for `hostPort` publication. Use `"127.0.0.1"` for loopback-only publication; `null`, blank, and `"0.0.0.0"` omit `hostIP` for wildcard compatibility. |
 | `image` | string | `"azul-zulu:25-jdk-alpine"` | Container image for instance Pods |
 | `imagePullPolicy` | string | `"IfNotPresent"` | K8s image pull policy (`Always`, `IfNotPresent`, `Never`) |
 | `workingDir` | string | `"/app"` | Working directory inside the Pod |
@@ -28,6 +29,10 @@ Configuration file: `./extensions/k8s/config.json`
 | `s3InitImage` | string | `"amazon/aws-cli:latest"` | Container image for S3 init containers |
 | `s3Bucket` | string | `null` | Override S3 bucket for init containers |
 | `s3Prefix` | string | `null` | Override S3 key prefix for init containers |
+
+`Configuration.hostAddress` does not control Kubernetes host-port binding. Set
+`hostPortBindAddress` in this extension configuration when a destination-scoped
+host-port binding is required.
 
 ## Sub-Schemas
 
@@ -74,6 +79,7 @@ Exactly one of `hostPath`, `emptyDir`, `configMapName`, `secretName`, or `claimN
   "factoryName": "kube",
   "namespace": "default",
   "image": "azul-zulu:25-jdk-alpine",
+  "hostPortBindAddress": "127.0.0.1",
   "hostDataPath": "/opt/universe/data",
   "timeoutSeconds": 30,
   "env": {

@@ -4,6 +4,7 @@
 
 [versions]
 kotlin = "2.4.0"
+junit = "5.14.3"
 shadow = "9.5.0"
 jib = "3.5.3"
 gradle-git-properties = "2.5.7"
@@ -47,6 +48,8 @@ dependencyDownload = { module = "dev.vankka:dependencydownload-runtime", version
 
 # kotlin
 kotlinGradlePlugin = { module = "org.jetbrains.kotlin:kotlin-gradle-plugin", version.ref = "kotlin" }
+kotlin-test-junit5 = { module = "org.jetbrains.kotlin:kotlin-test-junit5", version.ref = "kotlin" }
+junit-jupiter-engine = { module = "org.junit.jupiter:junit-jupiter-engine", version.ref = "junit" }
 
 # hazelcast
 hazelcast = { module = "com.hazelcast:hazelcast", version.ref = "hazelcast" }
@@ -98,6 +101,7 @@ logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "lo
 
 # fabric8 kubernetes client
 k8s-client = { module = "io.fabric8:kubernetes-client", version.ref = "k8s-client" }
+k8s-server-mock = { module = "io.fabric8:kubernetes-server-mock", version.ref = "k8s-client" }
 
 # database
 h2 = { module = "com.h2database:h2", version.ref = "h2" }

@@ -3,6 +3,8 @@ package gg.scala.universe.k8s
 import gg.scala.universe.console.LogLevel
 import gg.scala.universe.console.log
 import gg.scala.universe.runtime.RuntimeProvider
+import gg.scala.universe.runtime.RuntimeRecoveryInspector
+import gg.scala.universe.runtime.RuntimeResourceState
 import io.fabric8.kubernetes.api.model.Container
 import io.fabric8.kubernetes.api.model.ContainerBuilder
 import io.fabric8.kubernetes.api.model.EnvVarBuilder
@@ -37,16 +39,22 @@ import kotlin.time.Duration.Companion.seconds
  * Each instance runs in a dedicated Kubernetes Pod. Commands are executed
  * via `kubectl exec` equivalent through the Fabric8 client.
  */
-class K8sRuntimeProvider(
-    private val config: K8sConfig
-) : RuntimeProvider {
+class K8sRuntimeProvider private constructor(
+    private val config: K8sConfig,
+    providedClient: KubernetesClient?,
+    @Suppress("UNUSED_PARAMETER") useProvidedClient: Boolean
+) : RuntimeProvider, RuntimeRecoveryInspector {
+
+    constructor(config: K8sConfig) : this(config, null, false)
+
+    internal constructor(config: K8sConfig, client: KubernetesClient) : this(config, client, true)
 
     private var client: KubernetesClient? = null
     private val podNames = ConcurrentHashMap<String, String>()
 
     init {
         try {
-            client = createKubernetesClient()
+            client = providedClient ?: createKubernetesClient()
             log("Connected to Kubernetes cluster", LogLevel.SUCCESS)
 
             // Clean up orphaned services from previous crashes
@@ -94,21 +102,11 @@ class K8sRuntimeProvider(
             .withWorkingDir(config.workingDir)
             .withStdin(true)
             .withTty(true)
-            .addNewPort()
-                .withContainerPort(port)
-                .withHostPort(port)
-                .withProtocol("TCP")
-            .endPort()
+            .withPorts(K8sPortSpec.build(port, configuration.additionalPorts, config.hostPortBindAddress))
 
         // Add additional ports from the instance configuration (e.g. voice chat, metrics)
         configuration.additionalPorts.forEach { ap ->
             val proto = if (ap.protocol.equals("udp", ignoreCase = true)) "UDP" else "TCP"
-            containerBuilder.addNewPort()
-                .withContainerPort(ap.port)
-                .withHostPort(ap.port)
-                .withProtocol(proto)
-                .withName(ap.name.ifBlank { "port-${ap.port}" })
-                .endPort()
             log("K8s pod '$podName' additional port: ${ap.port}/$proto${if (ap.name.isNotBlank()) " (${ap.name})" else ""}")
         }
 
@@ -183,6 +181,9 @@ class K8sRuntimeProvider(
             }.build()
             containerBuilder.withResources(resources)
         }
+
+        val hostPortBindAddress = K8sPortSpec.resolveHostIp(config.hostPortBindAddress)
+        log("K8s pod '$podName' hostPort bind address: ${hostPortBindAddress ?: "wildcard (hostIP omitted)"}")
 
         // Environment variables
         val allEnv = mutableMapOf<String, String>()
@@ -297,38 +298,89 @@ class K8sRuntimeProvider(
     }
 
     override fun stop(instanceId: String) {
-        val podName = podNames.remove(instanceId) ?: return
-        val k8s = client ?: return
-        try {
-            // Delete pod first (this will also delete the service via ownerReference)
-            k8s.pods().inNamespace(config.namespace).withName(podName)
-                .withTimeoutInMillis(60.seconds.inWholeMilliseconds).delete()
-            log("Stopped K8s pod '$podName' for instance $instanceId")
-        } catch (e: Exception) {
-            // Pod stuck in Terminating — force delete
-            log("Pod '$podName' didn't terminate gracefully, force deleting...", LogLevel.WARNING)
+        val k8s = requireClient()
+        val podName = discoverPodName(k8s, instanceId)
+        if (podName != null) {
+            var gracefulFailure: Exception? = null
             try {
                 k8s.pods().inNamespace(config.namespace).withName(podName)
-                    .withGracePeriod(0).delete()
-                log("Force stopped K8s pod '$podName' for instance $instanceId")
-            } catch (e2: Exception) {
-                log("Failed to stop K8s pod '$podName' for instance $instanceId: ${e2.message}", LogLevel.ERROR)
+                    .withTimeoutInMillis(60.seconds.inWholeMilliseconds).delete()
+            } catch (e: Exception) {
+                gracefulFailure = e
+                log("Pod '$podName' didn't terminate gracefully, force deleting...", LogLevel.WARNING)
+                try {
+                    k8s.pods().inNamespace(config.namespace).withName(podName)
+                        .withGracePeriod(0).delete()
+                } catch (forceFailure: Exception) {
+                    throw IllegalStateException(
+                        "Failed to delete K8s pod '$podName' for instance $instanceId",
+                        forceFailure
+                    ).also { it.addSuppressed(gracefulFailure) }
+                }
             }
+
+            if (!waitForPodAbsent(k8s, config.namespace, podName, config.timeoutSeconds)) {
+                try {
+                    k8s.pods().inNamespace(config.namespace).withName(podName)
+                        .withGracePeriod(0).delete()
+                } catch (forceFailure: Exception) {
+                    throw IllegalStateException("K8s pod '$podName' still exists and force deletion failed", forceFailure)
+                }
+                check(waitForPodAbsent(k8s, config.namespace, podName, config.timeoutSeconds)) {
+                    "K8s pod '$podName' still exists after confirmed deletion attempts"
+                }
+            }
+            podNames.remove(instanceId, podName)
         }
 
-        // Fallback: manually delete the service if ownerReference didn't work
+        val serviceName = "universe-$instanceId"
         try {
-            val serviceName = "universe-$instanceId"
             k8s.services().inNamespace(config.namespace).withName(serviceName).delete()
-            log("Deleted service '$serviceName' for instance $instanceId")
+        } catch (failure: Exception) {
+            throw IllegalStateException("Failed to delete K8s service '$serviceName'", failure)
+        }
+        check(waitForServiceAbsent(k8s, config.namespace, serviceName, config.timeoutSeconds)) {
+            "K8s service '$serviceName' still exists after deletion"
+        }
+        log("Stopped K8s resources for instance $instanceId")
+    }
+
+    override fun inspectRecovered(
+        instanceId: String,
+        processPid: Long?,
+        workingDirectory: Path
+    ): RuntimeResourceState {
+        val k8s = try { requireClient() } catch (_: Exception) { return RuntimeResourceState.UNKNOWN }
+        return try {
+            val podName = discoverPodName(k8s, instanceId)
+                ?: return inspectRecoveredService(k8s, instanceId)
+            val pod = k8s.pods().inNamespace(config.namespace).withName(podName).get()
+                ?: return inspectRecoveredService(k8s, instanceId)
+            podNames[instanceId] = podName
+            when (pod.status?.phase) {
+                "Running" -> RuntimeResourceState.RUNNING
+                "Pending" -> RuntimeResourceState.PRESENT_TRANSITIONAL
+                "Succeeded", "Failed" -> RuntimeResourceState.TERMINAL
+                else -> RuntimeResourceState.UNKNOWN
+            }
         } catch (_: Exception) {
-            // Service may already be deleted by ownerReference
+            RuntimeResourceState.UNKNOWN
         }
     }
 
+    private fun inspectRecoveredService(
+        k8s: KubernetesClient,
+        instanceId: String
+    ): RuntimeResourceState {
+        val service = k8s.services().inNamespace(config.namespace)
+            .withName("universe-$instanceId").get()
+        return if (service == null) RuntimeResourceState.ABSENT
+        else RuntimeResourceState.CLEANUP_REQUIRED
+    }
+
     override fun getHostAddress(instanceId: String): String {
-        val podName = podNames[instanceId] ?: return ""
         val k8s = client ?: return ""
+        val podName = try { discoverPodName(k8s, instanceId) } catch (_: Exception) { null } ?: return ""
         return try {
             k8s.pods().inNamespace(config.namespace).withName(podName).get()
                 ?.status?.podIP ?: ""
@@ -385,28 +437,26 @@ class K8sRuntimeProvider(
     }
 
     override fun isRunning(instanceId: String): Boolean {
-        val podName = podNames[instanceId] ?: return false
-        val k8s = client ?: return false
-        return try {
-            val pod = k8s.pods().inNamespace(config.namespace).withName(podName).get()
-            pod?.status?.phase == "Running"
-        } catch (_: Exception) {
-            false
+        val k8s = requireClient()
+        val podName = discoverPodName(k8s, instanceId) ?: return false
+        val pod = k8s.pods().inNamespace(config.namespace).withName(podName).get()
+        if (pod == null) {
+            podNames.remove(instanceId, podName)
+            return false
         }
+        return pod.status?.phase == "Running"
     }
 
     override fun listRunningInstances(): List<String> {
-        val k8s = client ?: return emptyList()
-        return try {
-            k8s.pods().inNamespace(config.namespace)
+        val k8s = requireClient()
+        return k8s.pods().inNamespace(config.namespace)
                 .withLabel("app", "universe")
                 .list().items
                 .mapNotNull { pod ->
-                    pod.metadata?.labels?.get("universe-instance-id")
+                    pod.metadata?.labels?.get("universe-instance-id")?.also { id ->
+                        pod.metadata?.name?.let { podName -> podNames[id] = podName }
+                    }
                 }
-        } catch (_: Exception) {
-            emptyList()
-        }
     }
 
     /**
@@ -420,21 +470,59 @@ class K8sRuntimeProvider(
     }
 
     private fun removePodIfExists(k8s: KubernetesClient, namespace: String, name: String) {
-        try {
-            val existing = k8s.pods().inNamespace(namespace).withName(name).get()
-            if (existing != null) {
-                k8s.pods().inNamespace(namespace).withName(name).delete()
-                // Wait briefly for deletion
-                var attempts = 0
-                while (attempts < 20) {
-                    if (k8s.pods().inNamespace(namespace).withName(name).get() == null) break
-                    Thread.sleep(250)
-                    attempts++
-                }
+        val existing = k8s.pods().inNamespace(namespace).withName(name).get()
+        if (existing != null) {
+            k8s.pods().inNamespace(namespace).withName(name).delete()
+            if (!waitForPodAbsent(k8s, namespace, name, config.timeoutSeconds)) {
+                throw IllegalStateException("Stale K8s pod '$name' could not be removed before startup")
             }
-        } catch (_: Exception) {
-            // ignored
         }
+    }
+
+    private fun discoverPodName(k8s: KubernetesClient, instanceId: String): String? {
+        podNames[instanceId]?.let { mapped ->
+            if (k8s.pods().inNamespace(config.namespace).withName(mapped).get() != null) return mapped
+            podNames.remove(instanceId, mapped)
+        }
+        val canonical = "universe-$instanceId"
+        if (k8s.pods().inNamespace(config.namespace).withName(canonical).get() != null) {
+            podNames[instanceId] = canonical
+            return canonical
+        }
+        val discovered = k8s.pods().inNamespace(config.namespace)
+            .withLabel("app", "universe")
+            .withLabel("universe-instance-id", instanceId)
+            .list().items.firstOrNull()?.metadata?.name
+        if (discovered != null) podNames[instanceId] = discovered
+        return discovered
+    }
+
+    private fun waitForPodAbsent(
+        k8s: KubernetesClient,
+        namespace: String,
+        name: String,
+        timeoutSeconds: Int
+    ): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutSeconds.coerceAtLeast(1) * 1000L
+        do {
+            if (k8s.pods().inNamespace(namespace).withName(name).get() == null) return true
+            Thread.sleep(100)
+        } while (System.currentTimeMillis() < deadline)
+        return false
+    }
+
+    private fun waitForServiceAbsent(
+        k8s: KubernetesClient,
+        namespace: String,
+        name: String,
+        timeoutSeconds: Int
+    ): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutSeconds.coerceAtLeast(1) * 1000L
+        do {
+            if (k8s.services().inNamespace(namespace).withName(name).get() == null) return true
+            Thread.sleep(100)
+        } while (System.currentTimeMillis() < deadline)
+        return k8s.services().inNamespace(namespace).withName(name).get() == null
     }
 
     private fun waitForPodPhase(k8s: KubernetesClient, namespace: String, name: String, targetPhase: String, timeoutSeconds: Int): Boolean {
